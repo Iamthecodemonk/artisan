@@ -1,0 +1,73 @@
+import Wallet from '../models/Wallet.js';
+
+export async function getWallet(request, reply) {
+  try {
+    const userId = request.user?.id || request.query.userId;
+    if (!userId) return reply.code(400).send({ success: false, message: 'userId required' });
+    let wallet = await Wallet.findOne({ userId });
+    if (!wallet) {
+      wallet = await Wallet.create({ userId });
+    }
+    return reply.send({ success: true, data: wallet });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to get wallet' });
+  }
+}
+
+export async function creditWallet(request, reply) {
+  try {
+    const { userId, amount } = request.body || {};
+    if (!userId || typeof amount !== 'number') return reply.code(400).send({ success: false, message: 'userId and numeric amount required' });
+    const wallet = await Wallet.findOneAndUpdate({ userId }, { $inc: { balance: amount, totalEarned: amount } }, { new: true, upsert: true });
+    return reply.send({ success: true, data: wallet });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to credit wallet' });
+  }
+}
+
+export async function debitWallet(request, reply) {
+  try {
+    const { userId, amount } = request.body || {};
+    if (!userId || typeof amount !== 'number') return reply.code(400).send({ success: false, message: 'userId and numeric amount required' });
+    const wallet = await Wallet.findOne({ userId });
+    if (!wallet || wallet.balance < amount) return reply.code(400).send({ success: false, message: 'Insufficient balance' });
+    wallet.balance -= amount;
+    wallet.totalSpent = (wallet.totalSpent || 0) + amount;
+    wallet.totalJobs = (wallet.totalJobs || 0) + 1;
+    wallet.lastUpdated = new Date();
+    await wallet.save();
+    return reply.send({ success: true, data: wallet });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to debit wallet' });
+  }
+}
+
+export async function setPayoutDetails(request, reply) {
+  try {
+    const userId = request.user?.id;
+    if (!userId) return reply.code(401).send({ success: false, message: 'Unauthorized' });
+    const { name, account_number, bank_code, bank_name, currency } = request.body || {};
+    if (!account_number || !bank_code || !name) return reply.code(400).send({ success: false, message: 'name, account_number and bank_code are required' });
+
+    const updates = { payoutDetails: { name, account_number, bank_code, bank_name: bank_name || null, currency: currency || 'NGN' } };
+    // ensure wallet exists and save payout details
+    const wallet = await Wallet.findOneAndUpdate({ userId }, updates, { new: true, upsert: true });
+    return reply.send({ success: true, data: wallet });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to set payout details' });
+  }
+}
+
+  export async function getPayoutDetails(request, reply) {
+    const userId = request.user?._id;
+    if (!userId) return reply.code(401).send({ message: 'unauthenticated' });
+    const w = await Wallet.findOne({ userId });
+    if (!w || !w.payoutDetails) return reply.code(404).send({ message: 'no-payout-details' });
+    const pd = w.payoutDetails;
+    const masked = Object.assign({}, pd, { account_number: pd.account_number ? pd.account_number.slice(-4).padStart(pd.account_number.length, '*') : undefined });
+    return reply.send({ payoutDetails: masked, hasRecipient: !!w.paystackRecipientCode });
+  };

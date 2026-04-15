@@ -1,0 +1,30 @@
+# Ignore docs folder and all Markdown files
+docs/
+**/*.md
+
+# Common Node/Editor ignores
+node_modules/
+dist/
+build/
+coverage/
+.next/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime files
+*.pid
+*.seed
+
