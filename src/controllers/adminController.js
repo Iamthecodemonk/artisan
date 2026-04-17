@@ -8,10 +8,12 @@ import mongoose from 'mongoose';
 import Artisan from '../models/Artisan.js';
 import Quote from '../models/Quote.js';
 import Review from '../models/Review.js';
+import cloudinary from '../utils/cloudinary.js';
 // Transaction is already imported above
 import Wallet from '../models/Wallet.js';
 import { createNotification } from '../utils/notifier.js';
 const Kyc = (await import('../models/Kyc.js')).default;
+const UserModel = (await import('../models/User.js')).default;
 
 function computeProfileCompletion(user = {}, artisan = {}) {
   try {
@@ -49,6 +51,71 @@ function computeProfileCompletion(user = {}, artisan = {}) {
   } catch (e) {
     return 0;
   }
+}
+
+async function parseMultipartPayload(request, folder = 'uploads') {
+  const payload = {};
+  const files = [];
+
+  if (!request.isMultipart || typeof request.parts !== 'function') {
+    return { payload, files };
+  }
+
+  try {
+    for await (const part of request.parts()) {
+      if (part.file) {
+        try {
+          const res = await new Promise((resolve, reject) => {
+            const uploadStream = cloudinary.uploader.upload_stream({ folder, resource_type: 'auto' }, (err, result) => {
+              if (err) return reject(err);
+              resolve(result);
+            });
+            part.file.pipe(uploadStream);
+          });
+          files.push({
+            field: part.fieldname || part.field,
+            filename: part.filename,
+            mimetype: part.mimetype,
+            url: res.secure_url || res.url,
+            public_id: res.public_id,
+          });
+        } catch (err) {
+          request.log?.warn?.('admin cloudinary upload failed', err?.message || err);
+        }
+      } else {
+        const fieldName = part.fieldname || part.field;
+        if (!fieldName) continue;
+
+        let value;
+        if (typeof part.value === 'function') {
+          try {
+            value = await part.value();
+          } catch {
+            value = undefined;
+          }
+        } else {
+          value = part.value;
+        }
+
+        if (typeof value === 'string' && (value.startsWith('{') || value.startsWith('['))) {
+          try {
+            value = JSON.parse(value);
+          } catch {}
+        }
+
+        if (Object.prototype.hasOwnProperty.call(payload, fieldName)) {
+          if (!Array.isArray(payload[fieldName])) payload[fieldName] = [payload[fieldName]];
+          payload[fieldName].push(value);
+        } else {
+          payload[fieldName] = value;
+        }
+      }
+    }
+  } catch (err) {
+    request.log?.warn?.('admin multipart parse failed', err?.message || err);
+  }
+
+  return { payload, files };
 }
 
 export async function adminOverview(request, reply) {
@@ -128,6 +195,141 @@ export async function listArtisans(request, reply) {
   } catch (err) {
     request.log?.error?.(err);
     return reply.code(500).send({ success: false, message: 'Failed to list artisans' });
+  }
+}
+
+// Admin: create or update an artisan profile for a given userId
+export async function upsertArtisanProfile(request, reply) {
+  try {
+    const { userId } = request.params;
+    if (!userId) return reply.code(400).send({ success: false, message: 'userId required' });
+
+    let payload = request.body || {};
+    const userUpdates = {};
+
+    const contentType = request.headers['content-type'] || '';
+    const isMultipart = contentType.includes('multipart/form-data');
+    if (isMultipart) {
+      const parsed = await parseMultipartPayload(request, 'artisans/portfolio');
+      payload = parsed.payload;
+
+      const portfolioImageUrls = [];
+      for (const file of parsed.files) {
+        if (file.field === 'profileImage') {
+          userUpdates.profileImage = { url: file.url, public_id: file.public_id };
+          continue;
+        }
+
+        if (file.field === 'portfolioImage' || file.field === 'portfolioImages' || file.field.startsWith('portfolio')) {
+          portfolioImageUrls.push(file.url);
+          continue;
+        }
+
+        if (!payload.files) payload.files = [];
+        payload.files.push({ filename: file.filename, mimetype: file.mimetype, url: file.url, public_id: file.public_id, field: file.field });
+      }
+
+      if (portfolioImageUrls.length) {
+        if (!Array.isArray(payload.portfolio)) payload.portfolio = [];
+        if (payload.portfolio.length && Array.isArray(payload.portfolio[0]?.images)) {
+          payload.portfolio[0].images = payload.portfolio[0].images.concat(portfolioImageUrls);
+        } else if (payload.portfolio.length) {
+          payload.portfolio[0].images = (payload.portfolio[0].images || []).concat(portfolioImageUrls);
+        } else {
+          payload.portfolio.push({ title: 'Portfolio images', description: '', images: portfolioImageUrls, beforeAfter: false });
+        }
+      }
+    }
+
+    if (payload.profileImage && payload.profileImage.url) {
+      userUpdates.profileImage = payload.profileImage;
+      delete payload.profileImage;
+    }
+
+    // Normalize categories/trade inputs
+    if (payload.categories && !Array.isArray(payload.categories)) {
+      try {
+        payload.categories = JSON.parse(payload.categories);
+      } catch (e) {
+        payload.categories = [payload.categories];
+      }
+    }
+
+    const update = { ...payload, userId };
+
+    // Allow explicit verified flag from admin
+    if (typeof payload.verified !== 'undefined') update.verified = !!payload.verified;
+
+    const artisan = await Artisan.findOneAndUpdate({ userId }, update, { upsert: true, new: true, setDefaultsOnInsert: true });
+
+    if (Object.keys(userUpdates).length) {
+      await User.findByIdAndUpdate(userId, userUpdates).catch(() => {});
+    }
+
+    return reply.send({ success: true, data: artisan });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to upsert artisan profile' });
+  }
+}
+
+// Admin: create or update a KYC entry for a given userId
+export async function upsertKyc(request, reply) {
+  try {
+    const { userId } = request.params;
+    if (!userId) return reply.code(400).send({ success: false, message: 'userId required' });
+
+    let payload = request.body || {};
+
+    const contentType = request.headers['content-type'] || '';
+    const isMultipart = contentType.includes('multipart/form-data');
+    if (isMultipart) {
+      const parsed = await parseMultipartPayload(request, 'kyc');
+      payload = parsed.payload;
+      for (const file of parsed.files) {
+        if (['IdUploadFront', 'IdUploadBack', 'profileImage'].includes(file.field)) {
+          payload[file.field] = { url: file.url, public_id: file.public_id };
+        } else {
+          if (!payload.files) payload.files = [];
+          payload.files.push({ filename: file.filename, mimetype: file.mimetype, url: file.url, public_id: file.public_id, field: file.field });
+        }
+      }
+    }
+
+    // Allow admin to set status and reviewer
+    if (payload.status && !['pending', 'approved', 'rejected'].includes(payload.status)) {
+      return reply.code(400).send({ success: false, message: 'invalid status' });
+    }
+
+    const update = { ...payload, userId };
+    if (payload.reviewedBy) update.reviewedBy = payload.reviewedBy;
+
+    const kyc = await Kyc.findOneAndUpdate({ userId }, update, { upsert: true, new: true, setDefaultsOnInsert: true });
+
+    if (kyc.status === 'approved') {
+      await UserModel.findByIdAndUpdate(userId, { kycVerified: true }).catch(() => {});
+    }
+
+    return reply.send({ success: true, data: kyc });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to upsert kyc' });
+  }
+}
+
+// Admin: get KYC by userId
+export async function getKycByUser(request, reply) {
+  try {
+    const { userId } = request.params;
+    if (!userId) 
+      return reply.code(400).send({ success: false, message: 'userId required' });
+    const kyc = await Kyc.findOne({ userId }).lean();
+    if (!kyc) 
+      return reply.code(404).send({ success: false, message: 'KYC not found' });
+    return reply.send({ success: true, data: kyc });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(500).send({ success: false, message: 'Failed to fetch kyc' });
   }
 }
 
