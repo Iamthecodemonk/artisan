@@ -5,7 +5,7 @@ const userSchema = new mongoose.Schema({
   name: String,
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
   phone: { type: String, unique: true, sparse: true, trim: true },
-  password: String,
+  password: { type: String, select: false },
   role: { type: String, enum: ['guest', 'customer', 'artisan', 'admin'], default: 'guest' },
   authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
   banned: { type: Boolean, default: false },
@@ -23,5 +23,15 @@ const userSchema = new mongoose.Schema({
 // Ensure indexes are created
 userSchema.index({ email: 1 }, { unique: true });
 userSchema.index({ phone: 1 }, { unique: true, sparse: true });
+
+function stripSensitiveFields(_doc, ret) {
+  delete ret.password;
+  delete ret.resetPasswordToken;
+  delete ret.resetPasswordExpires;
+  return ret;
+}
+
+userSchema.set('toJSON', { transform: stripSensitiveFields });
+userSchema.set('toObject', { transform: stripSensitiveFields });
 
 export default mongoose.model('User', userSchema);

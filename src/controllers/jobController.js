@@ -2,12 +2,16 @@ import Job from '../models/Job.js';
 import Application from '../models/Application.js';
 import Booking from '../models/Booking.js';
 import Quote from '../models/Quote.js';
+import Chat from '../models/Chat.js';
 import { createNotification } from '../utils/notifier.js';
 import { notifyArtisansAboutJob } from '../utils/notifier.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cloudinary from '../utils/cloudinary.js';
+import { normalizePaymentMode } from '../utils/paymentMode.js';
+const JobCategory = (await import('../models/JobCategory.js')).default;
+const User = (await import('../models/User.js')).default;
 
 export async function createJob(request, reply) {
   try {
@@ -16,7 +20,6 @@ export async function createJob(request, reply) {
     // validate categoryId if provided
     if (payload.categoryId) {
       // lazy import to avoid cycles
-      const JobCategory = (await import('../models/JobCategory.js')).default;
       const cat = await JobCategory.findById(payload.categoryId);
       if (!cat) return reply.code(400).send({ success: false, message: 'Invalid categoryId' });
     }
@@ -83,8 +86,7 @@ export async function listJobs(request, reply) {
     
     // If requester is admin, populate client details and category details
     if (isAdmin) {
-      const User = (await import('../models/User.js')).default;
-      const JobCategory = (await import('../models/JobCategory.js')).default;
+      // const JobCategory = (await import('../models/JobCategory.js')).default;
       
       // Filter out null/undefined BEFORE converting to string
       const clientIds = [...new Set(jobs.map(j => j.clientId).filter(id => id != null).map(id => String(id)))];
@@ -255,8 +257,34 @@ export async function acceptApplication(request, reply) {
     job.status = 'filled';
     await job.save();
 
+    const requestedPaymentMode = normalizePaymentMode(request.body?.paymentMode) || 'upfront';
+    if (typeof request.body?.paymentMode !== 'undefined' && requestedPaymentMode === null) {
+      return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+    }
+
+    const bookingStatus = requestedPaymentMode === 'afterCompletion' ? 'awaiting-acceptance' : 'pending';
+
     // create a booking when application accepted
-    const booking = await Booking.create({ customerId: job.clientId, artisanId: app.artisanId, service: job.title, schedule: job.schedule || new Date(), price: app.proposedPrice || job.budget || 0, status: 'pending', paymentStatus: 'unpaid' });
+    const booking = await Booking.create({
+      customerId: job.clientId,
+      artisanId: app.artisanId,
+      service: job.title,
+      schedule: job.schedule || new Date(),
+      price: app.proposedPrice || job.budget || 0,
+      status: bookingStatus,
+      paymentStatus: 'unpaid',
+      paymentMode: requestedPaymentMode,
+    });
+
+    // ensure chat exists for the booking so artisan/customer can communicate
+    try {
+      const chat = await Chat.create({ bookingId: booking._id, participants: [job.clientId, app.artisanId], messages: [] });
+      booking.chatId = chat._id;
+      await booking.save();
+    } catch (e) {
+      request.log?.warn?.('create booking chat failed', e?.message || e);
+    }
+
     // notify artisan (send email to artisan's registered email if available)
     try {
       const User = (await import('../models/User.js')).default;

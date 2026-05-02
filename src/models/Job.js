@@ -18,11 +18,11 @@ const jobSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 
-// generate a short public id like 'rij' + 6 alnum chars
+// generate a public id like 'rh+' + 8 alnum chars
 function makePublicId() {
   // use base64 then strip non-alnum to get compact chars
-  const s = crypto.randomBytes(6).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0,6);
-  return `rij${s}`;
+  const s = crypto.randomBytes(8).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0,8);
+  return `rh+${s}`;
 }
 
 // Ensure a publicId is generated and unique on create

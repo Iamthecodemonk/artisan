@@ -16,6 +16,13 @@ import Wallet from '../models/Wallet.js';
 import DeviceTokenAudit from '../models/DeviceTokenAudit.js';
 import mongoose from 'mongoose';
 
+function getUserKycFlags(status) {
+  if (status === 'approved') {
+    return { kycLevel: 2, kycVerified: true, isVerified: true };
+  }
+  return { kycLevel: 1, kycVerified: false, isVerified: false };
+}
+
 export async function getAllUsers(req, reply) {
   try {
     const { page = 1, limit = 50, role, q } = req.query || {};
@@ -59,8 +66,31 @@ export async function getMyProfile(req, reply) {
     const userId = req.user?.id;
     console.log(userId);
     if (!userId) return reply.code(401).send({ success: false, message: 'Unauthorized' });
-    const user = await User.findById(userId);
+    const [user, latestKyc] = await Promise.all([
+      User.findById(userId),
+      Kyc.findOne({ userId }).sort({ createdAt: -1 }).lean(),
+    ]);
     if (!user) return reply.code(404).send({ success: false, message: 'User not found' });
+
+    if (latestKyc) {
+      const nextFlags = getUserKycFlags(latestKyc.status);
+      const needsSync =
+        user.kycLevel !== nextFlags.kycLevel ||
+        !!user.kycVerified !== nextFlags.kycVerified ||
+        !!user.isVerified !== nextFlags.isVerified;
+
+      if (needsSync) {
+        user.kycLevel = nextFlags.kycLevel;
+        user.kycVerified = nextFlags.kycVerified;
+        user.isVerified = nextFlags.isVerified;
+        try {
+          await User.findByIdAndUpdate(userId, { $set: nextFlags });
+        } catch (syncErr) {
+          req.log?.warn?.({ err: syncErr?.message || syncErr, userId }, 'failed to sync user kyc flags from latest kyc record');
+        }
+      }
+    }
+
     return reply.send({ success: true, data: user });
   } catch (err) {
     req.log?.error?.(err);

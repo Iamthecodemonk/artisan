@@ -1,5 +1,7 @@
 import Chat from '../models/Chat.js';
 import User from '../models/User.js';
+import Booking from '../models/Booking.js';
+import { createNotification } from '../utils/notifier.js';
 
 export async function fetchThread(request, reply) {
   try {
@@ -49,6 +51,34 @@ export async function sendMessage(request, reply) {
       }
     } catch (e) {
       request.log?.warn?.('socket emit failed', e?.message);
+    }
+
+    // Notify other participants (non-blocking)
+    try {
+      const sender = await User.findById(senderId).select('name');
+      const otherParticipantIds = (thread.participants || []).map(String).filter(id => id !== String(senderId));
+      const title = `${sender?.name || 'New message'}`;
+      const body = text.length > 120 ? text.substring(0, 117) + '...' : text;
+      // fetch booking name for context if available
+      let bookingName = null;
+      try {
+        if (thread.bookingId) {
+          const b = await Booking.findById(thread.bookingId).select('service').lean();
+          bookingName = b?.service || null;
+        }
+      } catch (e) {
+        request.log?.warn?.('failed to lookup booking for chat notify', e?.message || e);
+      }
+      for (const pid of otherParticipantIds) {
+        try {
+          // include bookingName and bookingId in data if present for context
+          await createNotification(request.server, pid, { type: 'chat', title, body, data: { threadId, bookingId: thread.bookingId, bookingName, senderId } });
+        } catch (e) {
+          request.log?.warn?.('notify participant failed', e?.message || e);
+        }
+      }
+    } catch (e) {
+      request.log?.warn?.('chat notify failed', e?.message || e);
     }
 
     return reply.code(201).send({ success: true, data: thread.messages[thread.messages.length - 1] });

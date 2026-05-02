@@ -7,8 +7,96 @@ import Quote from '../models/Quote.js';
 import Job from '../models/Job.js';
 import SpecialServiceRequest from '../models/SpecialServiceRequest.js';
 import { createNotification } from '../utils/notifier.js';
+import { getConfig } from '../utils/config.js';
+import { normalizePaymentMode } from '../utils/paymentMode.js';
+import { attemptPaystackTransfer, creditArtisanWalletIfNeeded, ensurePaystackRecipient, getPayoutNotificationState, hasFinalizedPayout } from '../utils/payout.js';
+import { getPaystackCallbackUrl } from '../utils/paystack.js';
+import { formatNotificationMoney } from '../utils/notificationText.js';
 import crypto from 'crypto';
 import axios from 'axios';
+
+async function releaseCompletedDeferredBookingPayment(booking, tx, request) {
+  if (!booking || !tx || booking.paymentMode !== 'afterCompletion' || booking.status !== 'completed') return;
+  if (hasFinalizedPayout(tx) || tx.transferRef) return;
+  if (tx.status !== 'holding' && tx.status !== 'released') return;
+  const amount = Number(tx.amount || booking.price || 0);
+  let feePct = 0;
+  try {
+    const cfgVal = await getConfig('COMPANY_FEE_PCT');
+    if (cfgVal !== null && !isNaN(Number(cfgVal))) feePct = Number(cfgVal);
+  } catch (e) {
+    request.log?.warn?.('Failed to read COMPANY_FEE_PCT for payout', e?.message || e);
+  }
+  const fee = Math.round((amount * feePct) / 100 * 100) / 100;
+  const payAmount = Math.round((amount - fee) * 100) / 100;
+  tx.companyFee = fee;
+  tx.status = 'released';
+  tx.releasedAt = tx.releasedAt || new Date();
+  await tx.save();
+
+  const artisanDoc = await Artisan.findOne({ userId: booking.artisanId._id });
+  let wallet = await Wallet.findOne({ userId: booking.artisanId._id });
+  if (!wallet) wallet = await Wallet.create({ userId: booking.artisanId._id });
+  let recipientCode = wallet?.paystackRecipientCode || artisanDoc?.paystackRecipientCode || null;
+
+  if (!recipientCode) recipientCode = await ensurePaystackRecipient({ wallet, artisanDoc, request });
+
+  const autoPayout = String(process.env.PAYSTACK_AUTO_PAYOUT || '').toLowerCase() === 'true';
+  let transferResult = { attempted: false, finalized: false, succeeded: false };
+  if (String(process.env.PAYSTACK_AUTO_PAYOUT || '').toLowerCase() === 'true' && process.env.PAYSTACK_SECRET_KEY && recipientCode) {
+    transferResult = await attemptPaystackTransfer({ tx, booking, payAmount, recipientCode, request });
+  }
+
+  if (transferResult.finalized && transferResult.succeeded) {
+    tx.status = 'paid';
+    await tx.save();
+  } else if (!autoPayout || !transferResult.attempted || (transferResult.attempted && !transferResult.succeeded && !transferResult.inFlight)) {
+    await creditArtisanWalletIfNeeded({ tx, wallet, payAmount });
+  }
+
+  try {
+    const CompanyEarning = (await import('../models/CompanyEarning.js')).default;
+    if (fee > 0) {
+      try {
+        await CompanyEarning.create({ transactionId: tx._id, bookingId: booking._id, amount: fee, note: 'Platform commission' });
+      } catch (e) { request.log?.warn?.('failed to record company earning for deferred completed booking', e?.message || e); }
+
+      if (process.env.COMPANY_USER_ID) {
+        try {
+          const companyWallet = await Wallet.findOne({ userId: process.env.COMPANY_USER_ID }) || await Wallet.create({ userId: process.env.COMPANY_USER_ID });
+          companyWallet.balance = (companyWallet.balance || 0) + fee;
+          companyWallet.totalEarned = (companyWallet.totalEarned || 0) + fee;
+          companyWallet.lastUpdated = new Date();
+          await companyWallet.save();
+          const bookingNameForCompany = booking?.service || `booking`;
+          await createNotification(request.server, process.env.COMPANY_USER_ID, { type: 'commission', title: 'Commission received', body: `${formatNotificationMoney(fee)} commission received for ${bookingNameForCompany}.`, data: { bookingId: booking._id, bookingName: bookingNameForCompany, amount: fee } });
+        } catch (e) { request.log?.warn?.('credit company wallet failed for deferred completed booking', e?.message || e); }
+      }
+    }
+  } catch (e) {
+    request.log?.warn?.('company earning handling failed for deferred completed booking', e?.message || e);
+  }
+
+  try {
+    if (booking.customerId?._id) {
+      const customerWallet = await Wallet.findOne({ userId: booking.customerId._id }) || await Wallet.create({ userId: booking.customerId._id });
+      customerWallet.totalSpent = (customerWallet.totalSpent || 0) + amount;
+      customerWallet.lastUpdated = new Date();
+      await customerWallet.save();
+    }
+  } catch (e) {
+    request.log?.warn?.('failed to update customer wallet for deferred completed booking', e?.message || e);
+  }
+
+  try {
+    const bookingNameForJobComplete = booking?.service || 'your booking';
+    const payoutNotice = getPayoutNotificationState(tx);
+    await createNotification(request.server, booking.artisanId._id, { type: 'job_complete', title: payoutNotice.artisanTitle, body: `${bookingNameForJobComplete}: ${payoutNotice.artisanBodySuffix}`, data: { bookingId: booking._id, bookingName: bookingNameForJobComplete, amount: payAmount, transferStatus: tx.transferStatus, payoutStatus: tx.status } });
+    await createNotification(request.server, booking.customerId._id, { type: 'job_complete', title: payoutNotice.customerTitle, body: `Payment for ${bookingNameForJobComplete} has been received. ${payoutNotice.customerBodySuffix}`, data: { bookingId: booking._id, bookingName: bookingNameForJobComplete, transferStatus: tx.transferStatus, payoutStatus: tx.status } });
+  } catch (e) {
+    request.log?.warn?.('notify parties failed for deferred completed booking', e?.message || e);
+  }
+}
 
 // Get list of banks from Paystack (returns bank name and code)
 export async function getPaystackBanks(request, reply) {
@@ -56,11 +144,13 @@ export async function initializePaystackTransaction(request, reply) {
     if (!email || !amount) return reply.code(400).send({ success: false, message: 'email and amount required' });
 
     const amountInKobo = Math.round(Number(amount) * 100);
+    const callbackUrl = getPaystackCallbackUrl();
 
     const res = await axios.post('https://api.paystack.co/transaction/initialize', {
       email,
       amount: amountInKobo,
-      metadata: { bookingId, customerCoords }
+      metadata: { bookingId, customerCoords },
+      callback_url: callbackUrl
     }, {
       headers: {
         Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
@@ -81,6 +171,32 @@ export async function initializePaystackTransaction(request, reply) {
     request.log?.error?.(err?.response?.data || err?.message);
     return reply.code(500).send({ success: false, message: 'Failed to initialize Paystack transaction' });
   }
+}
+
+export async function paystackCallback(request, reply) {
+  const reference = request.query?.reference || request.query?.trxref || '';
+  const escapedReference = String(reference)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  return reply
+    .type('text/html; charset=utf-8')
+    .send(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Payment received</title>
+  </head>
+  <body style="font-family: Arial, sans-serif; text-align: center; padding: 40px;">
+    <h2>Payment received</h2>
+    <p>You can return to the Rijhub app.</p>
+    ${escapedReference ? `<p style="color:#666;font-size:14px;">Reference: ${escapedReference}</p>` : ''}
+  </body>
+</html>`);
 }
 
 export async function verifyPayment(request, reply) {
@@ -134,6 +250,7 @@ export async function verifyPayment(request, reply) {
                   const jobIdFromMeta = res.data.data?.metadata?.jobId || res.data.data?.metadata?.job_id;
                   const job = jobIdFromMeta ? await Job.findByIdOrPublic(jobIdFromMeta) : await Job.findByIdOrPublic(quote.jobId);
                   const customerId = quote.customerId || (job ? job.clientId : null);
+                  const paymentMode = normalizePaymentMode(res.data.data?.metadata?.paymentMode || res.data.data?.metadata?.payment_mode);
                   const payload = {
                     customerId,
                     artisanId: quote.artisanId,
@@ -142,6 +259,7 @@ export async function verifyPayment(request, reply) {
                     price: quote.total || 0,
                     status: 'accepted',
                     paymentStatus: 'paid',
+                    paymentMode,
                     acceptedQuote: quote._id,
                   };
                   const created = await Booking.create(payload);
@@ -228,7 +346,8 @@ export async function verifyPayment(request, reply) {
                 await booking.save();
               }
 
-              await createNotification(request.server, booking.artisanId._id, { type: 'booking', title: 'New booking confirmed', body: `Booking ${booking._id} has been paid.`, data: { bookingId: booking._id, chatId: booking.chatId, email: booking.artisanId?.email, sendEmail: true } });
+              const bookingName = booking?.service || 'your booking';
+              await createNotification(request.server, booking.artisanId._id, { type: 'booking', title: 'New booking confirmed', body: `${bookingName} has been paid.`, data: { bookingId: booking._id, bookingName, chatId: booking.chatId, email: booking.artisanId?.email, sendEmail: true } });
             } catch (e) {
               request.log?.warn?.('verifyPayment: post-booking actions failed', e?.message || e);
             }
@@ -278,12 +397,15 @@ export async function listPayments(request, reply) {
 export async function paymentWebhook(request, reply) {
   try {
     const payload = request.body || {};
-    // If Paystack is used, validate signature header
+    const webhookSecret = process.env.PAYSTACK_WEBHOOK_SECRET;
     const paystackSig = request.headers['x-paystack-signature'] || request.headers['x-paystack-signature'.toLowerCase()];
-    if (process.env.PAYSTACK_SECRET && paystackSig) {
-      const secret = process.env.PAYSTACK_SECRET;
-      const bodyString = JSON.stringify(payload);
-      const expected = crypto.createHmac('sha512', secret).update(bodyString).digest('hex');
+    if (payload.event && webhookSecret) {
+      if (!paystackSig) {
+        request.log?.warn?.('Missing Paystack signature header');
+        return reply.code(401).send({ success: false, message: 'Missing signature' });
+      }
+      const bodyString = request.rawBody || JSON.stringify(payload);
+      const expected = crypto.createHmac('sha512', webhookSecret).update(bodyString).digest('hex');
       if (expected !== paystackSig) {
         request.log?.warn?.('Invalid Paystack signature');
         return reply.code(401).send({ success: false, message: 'Invalid signature' });
@@ -312,13 +434,16 @@ export async function paymentWebhook(request, reply) {
           try {
             const quote = await Quote.findById(qId);
             if (quote) {
+              let booking = null;
               const job = jId ? await Job.findByIdOrPublic(jId) : await Job.findByIdOrPublic(quote.jobId);
               // idempotency: if a booking already exists for this quote, reuse it
               const existingBooking = await Booking.findOne({ acceptedQuote: quote._id });
               if (existingBooking) {
                 bookingId = String(existingBooking._id);
+                booking = existingBooking;
               } else {
                 const customerId = quote.customerId || (job ? job.clientId : null);
+                const paymentMode = normalizePaymentMode(payload.data?.metadata?.paymentMode || payload.data?.metadata?.payment_mode);
                 const bookingPayload = {
                   customerId,
                   artisanId: quote.artisanId,
@@ -327,9 +452,10 @@ export async function paymentWebhook(request, reply) {
                   price: quote.total || 0,
                   status: 'accepted',
                   paymentStatus: 'paid',
+                  paymentMode,
                   acceptedQuote: quote._id,
                 };
-                const booking = await Booking.create(bookingPayload);
+                booking = await Booking.create(bookingPayload);
                 bookingId = String(booking._id);
                 // If this booking originated from a Job, mark that Job closed to prevent further applications
                 try {
@@ -342,13 +468,13 @@ export async function paymentWebhook(request, reply) {
                 }
               }
               // update quote to reference booking if desired
-              try { quote.bookingId = booking._id; await quote.save(); } catch (e) { /* non-fatal */ }
+              try { if (booking?._id) { quote.bookingId = booking._id; await quote.save(); } } catch (e) { /* non-fatal */ }
               // update existing transaction (if any) to reference booking
               const ref = payload.data?.reference;
               if (ref) {
                 const tx = await Transaction.findOne({ paymentGatewayRef: ref });
                 if (tx) {
-                  tx.bookingId = booking._id;
+                  tx.bookingId = booking?._id || existingBooking?._id;
                   tx.status = 'holding';
                   await tx.save();
                 }
@@ -357,43 +483,45 @@ export async function paymentWebhook(request, reply) {
           } catch (e) {
             request.log?.error?.('failed to create booking from quote metadata', e?.message || e);
           }
-          // specialRequest flow: create booking from special request metadata
-          if (!bookingId && sReqId) {
-            try {
-              const sreq = await SpecialServiceRequest.findById(sReqId).lean();
-              if (sreq) {
-                if (sreq.bookingId) {
-                  bookingId = String(sreq.bookingId);
-                  try {
-                    // mark special request as confirmed when an existing booking is found
-                    await SpecialServiceRequest.findByIdAndUpdate(sReqId, { status: 'confirmed', updatedAt: new Date() });
-                  } catch (e) { /* non-fatal */ }
-                } else {
-                  const selectedPrice = payload.data?.metadata?.selectedPrice || payload.data?.metadata?.selected_price;
-                  const price = selectedPrice || sreq.artisanReply?.quote || (Array.isArray(sreq.artisanReply?.options) && sreq.artisanReply.options[0]) || sreq.budget || 0;
-                  const bookingPayload = {
-                    customerId: sreq.clientId,
-                    artisanId: sreq.artisanId,
-                    service: sreq.title || 'Service',
-                    schedule: sreq.date || new Date(),
-                    price: Number(price) || 0,
-                    status: 'accepted',
-                    paymentStatus: 'paid',
-                  };
-                  const created = await Booking.create(bookingPayload);
-                  bookingId = String(created._id);
-                  try { await SpecialServiceRequest.findByIdAndUpdate(sReqId, { bookingId: created._id, status: 'confirmed', updatedAt: new Date() }); } catch (e) { /* non-fatal */ }
-                  // attach tx if reference present
-                  const ref = payload.data?.reference;
-                  if (ref) {
-                    const tx = await Transaction.findOne({ paymentGatewayRef: ref });
-                    if (tx) { tx.bookingId = created._id; tx.status = 'holding'; await tx.save(); }
-                  }
+        }
+        // specialRequest flow: create booking from special request metadata
+        if (!bookingId && sReqId) {
+          try {
+            const sreq = await SpecialServiceRequest.findById(sReqId).lean();
+            if (sreq) {
+              if (sreq.bookingId) {
+                bookingId = String(sreq.bookingId);
+                try {
+                  // mark special request as confirmed when an existing booking is found
+                  await SpecialServiceRequest.findByIdAndUpdate(sReqId, { status: 'confirmed', updatedAt: new Date() });
+                } catch (e) { /* non-fatal */ }
+              } else {
+                const selectedPrice = payload.data?.metadata?.selectedPrice || payload.data?.metadata?.selected_price;
+                const price = selectedPrice || sreq.artisanReply?.quote || (Array.isArray(sreq.artisanReply?.options) && sreq.artisanReply.options[0]) || sreq.budget || 0;
+                const paymentMode = normalizePaymentMode(payload.data?.metadata?.paymentMode || payload.data?.metadata?.payment_mode);
+                const bookingPayload = {
+                  customerId: sreq.clientId,
+                  artisanId: sreq.artisanId,
+                  service: sreq.title || 'Service',
+                  schedule: sreq.date || new Date(),
+                  price: Number(price) || 0,
+                  status: 'accepted',
+                  paymentStatus: 'paid',
+                  paymentMode,
+                };
+                const created = await Booking.create(bookingPayload);
+                bookingId = String(created._id);
+                try { await SpecialServiceRequest.findByIdAndUpdate(sReqId, { bookingId: created._id, status: 'confirmed', updatedAt: new Date() }); } catch (e) { /* non-fatal */ }
+                // attach tx if reference present
+                const ref = payload.data?.reference;
+                if (ref) {
+                  const tx = await Transaction.findOne({ paymentGatewayRef: ref });
+                  if (tx) { tx.bookingId = created._id; tx.status = 'holding'; await tx.save(); }
                 }
               }
-            } catch (e) {
-              request.log?.error?.('failed to create booking from specialRequest metadata', e?.message || e);
             }
+          } catch (e) {
+            request.log?.error?.('failed to create booking from specialRequest metadata', e?.message || e);
           }
         }
       } else if (payload.event === 'transfer.success' || payload.event === 'transfer.processed' || payload.event === 'transfer.completed') {
@@ -403,6 +531,7 @@ export async function paymentWebhook(request, reply) {
           const tx = await Transaction.findOne({ transferRef: transferCode });
           if (tx) {
             tx.transferStatus = 'success';
+            tx.status = 'paid';
             await tx.save();
             // notify artisan and company
             await createNotification(request.server, tx.payeeId, { type: 'payout', title: 'Payout completed', body: `Payout for booking ${tx.bookingId} completed.`, data: { bookingId: tx.bookingId } });
@@ -444,14 +573,16 @@ export async function paymentWebhook(request, reply) {
                 await Booking.findByIdAndDelete(booking._id);
               } catch (e) { request.log?.warn?.('failed to delete booking after failed payment', e?.message || e); }
               try { await SpecialServiceRequest.findByIdAndUpdate(sreq._id, { bookingId: undefined, status: 'accepted', updatedAt: new Date() }); } catch (e) { request.log?.warn?.('failed to clear bookingId on special request after failed payment', e?.message || e); }
-              await createNotification(request.server, sreq.clientId, { type: 'payment', title: 'Payment failed', body: `Payment for request ${sreq._id} failed. Booking was removed. Please retry.`, data: { requestId: sreq._id } });
+              const sreqName = sreq.title || sreq.categoryName || 'special request';
+              await createNotification(request.server, sreq.clientId, { type: 'payment', title: 'Payment failed', body: `Payment for your special request failed. Booking was removed. Please retry.`, data: { requestId: sreq._id, requestName: sreqName } });
               return reply.code(200).send({ success: true, message: 'Handled charge.failed and cleaned up special request booking' });
             }
           } catch (e) {
             request.log?.warn?.('failed to cleanup booking after charge.failed', e?.message || e);
           }
 
-          await createNotification(request.server, booking.customerId._id, { type: 'payment', title: 'Payment failed', body: `Payment for booking ${booking._id} failed. Please retry.`, data: { bookingId: booking._id } });
+          const bookingName = booking?.service || 'your booking';
+          await createNotification(request.server, booking.customerId._id, { type: 'payment', title: 'Payment failed', body: `Payment for ${bookingName} failed. Please retry.`, data: { bookingId: booking._id, bookingName } });
         }
         return reply.code(200).send({ success: true, message: 'Handled charge.failed' });
       } else {
@@ -494,11 +625,25 @@ export async function paymentWebhook(request, reply) {
         request.log?.error?.('distance calc error', e?.message);
       }
 
-      // create holding transaction
-      await Transaction.create({ bookingId: booking._id, payerId: booking.customerId._id, payeeId: booking.artisanId._id, amount: booking.price || 0, status: 'holding', paymentGatewayRef: _g });
+      // create or reuse holding transaction to keep webhook redeliveries idempotent
+      let tx = await Transaction.findOne({ paymentGatewayRef: _g });
+      if (tx) {
+        tx.bookingId = booking._id;
+        tx.payerId = booking.customerId._id;
+        tx.payeeId = booking.artisanId._id;
+        tx.amount = booking.price || tx.amount || 0;
+        tx.status = 'holding';
+        await tx.save();
+      } else {
+        tx = await Transaction.create({ bookingId: booking._id, payerId: booking.customerId._id, payeeId: booking.artisanId._id, amount: booking.price || 0, status: 'holding', paymentGatewayRef: _g });
+      }
+      if (booking.status === 'completed' && booking.paymentMode === 'afterCompletion') {
+        await releaseCompletedDeferredBookingPayment(booking, tx, request);
+      }
 
       // notify artisan
-      await createNotification(request.server, booking.artisanId._id, { type: 'booking', title: 'New booking confirmed', body: `Booking ${booking._id} has been paid.`, data: { bookingId: booking._id, chatId: booking.chatId, email: booking.artisanId.email, sendEmail: true } });
+      const bookingName = booking?.service || 'your booking';
+      await createNotification(request.server, booking.artisanId._id, { type: 'booking', title: 'New booking confirmed', body: `${bookingName} has been paid.`, data: { bookingId: booking._id, bookingName, chatId: booking.chatId, email: booking.artisanId.email, sendEmail: true } });
 
       return reply.send({ success: true, data: booking });
     }

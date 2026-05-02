@@ -15,6 +15,7 @@ import {
 import { createJobQuote, listJobQuotes } from '../controllers/quoteController.js';
 import { verifyJWT } from '../middlewares/auth.js';
 import { requireRole } from '../middlewares/roles.js';
+import { requireActiveArtisan } from '../middlewares/requireActiveArtisan.js';
 
 export default async function jobRoutes(fastify, opts) {
   const idParams = { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } };
@@ -99,21 +100,42 @@ export default async function jobRoutes(fastify, opts) {
   });
   fastify.get('/',{ preHandler: [verifyJWT] }, listJobs);
   fastify.get('/:id', { schema: idParams }, getJob);
-  fastify.post('/:id/apply', { preHandler: [verifyJWT, requireRole('artisan')] }, applyJob);
+  fastify.post('/:id/apply', { preHandler: [verifyJWT, requireActiveArtisan()] }, applyJob);
   fastify.put('/:id', { preHandler: [verifyJWT, requireRole(['client','customer'])], schema: updateSchema }, updateJob);
   // partial update (PATCH) -- owner only, same controller handles allowed fields
   fastify.patch('/:id', { preHandler: [verifyJWT, requireRole(['client','customer'])], schema: updateSchema }, updateJob);
   fastify.get('/:id/applications', { preHandler: [verifyJWT, requireRole(['client','customer'])] }, listApplications);
-  fastify.post('/:id/applications/:appId/accept', { preHandler: [verifyJWT, requireRole(['client','customer'])] }, acceptApplication);
+  fastify.post('/:id/applications/:appId/accept', { preHandler: [verifyJWT, requireRole(['client','customer'])], schema: {
+    params: idParams.params,
+    body: {
+      type: 'object',
+      properties: {
+        paymentMode: { type: 'string', enum: ['upfront', 'afterCompletion'] }
+      },
+      additionalProperties: false
+    }
+  } }, acceptApplication);
   fastify.delete('/:id', { preHandler: [verifyJWT, requireRole(['client','customer'])] }, deleteJob);
-  fastify.patch('/:id/applications/:appId', { preHandler: [verifyJWT, requireRole('artisan')] }, updateApplication);
-  fastify.post('/:id/applications/:appId/withdraw', { preHandler: [verifyJWT, requireRole('artisan')] }, withdrawApplication);
+  fastify.patch('/:id/applications/:appId', { preHandler: [verifyJWT, requireActiveArtisan()] }, updateApplication);
+  fastify.post('/:id/applications/:appId/withdraw', { preHandler: [verifyJWT, requireActiveArtisan()] }, withdrawApplication);
   fastify.post('/:id/attachments', { preHandler: [verifyJWT, requireRole(['client','customer']), (request, reply) => import('../middlewares/cloudinaryStream.js').then(m => m.default(request, reply))] }, uploadJobAttachment);
   fastify.delete('/:id/attachments', { preHandler: verifyJWT }, deleteJobAttachment);
   // Job-level quotes
-  fastify.post('/:id/quotes', { preHandler: [verifyJWT, requireRole('artisan')], schema: createJobQuoteSchema }, createJobQuote);
+  fastify.post('/:id/quotes', { preHandler: [verifyJWT, requireActiveArtisan()], schema: createJobQuoteSchema }, createJobQuote);
   fastify.get('/:id/quotes', { preHandler: [verifyJWT] }, listJobQuotes);
-  fastify.post('/:id/quotes/:quoteId/accept', { preHandler: [verifyJWT, requireRole(['client','customer'])] }, async (request, reply) => {
+  fastify.post('/:id/quotes/:quoteId/accept', {
+    preHandler: [verifyJWT, requireRole(['client','customer'])],
+    schema: {
+      params: idParams.params,
+      body: {
+        type: 'object',
+        properties: {
+          paymentMode: { type: 'string', enum: ['upfront', 'afterCompletion'] }
+        },
+        additionalProperties: false
+      }
+    }
+  }, async (request, reply) => {
     const { acceptJobQuote } = await import('../controllers/quoteController.js');
     return acceptJobQuote(request, reply);
   });

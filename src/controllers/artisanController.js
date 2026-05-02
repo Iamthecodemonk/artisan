@@ -38,6 +38,136 @@ function computeProfileProgress(artisanObj = {}, kycInfo = null) {
   }
 }
 
+function dedupeArtisansByUser(results = []) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const result of results) {
+    const obj = result && result.toObject ? result.toObject() : result;
+    const rawUserId = obj?.userId && (typeof obj.userId === 'string'
+      ? obj.userId
+      : obj.userId?._id
+        ? String(obj.userId._id)
+        : String(obj.userId));
+    const key = rawUserId || String(obj?._id || '');
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(obj);
+  }
+
+  return deduped;
+}
+
+function clonePortfolioItems(items = []) {
+  return Array.isArray(items)
+    ? items.map((item) => ({
+        ...(item && typeof item === 'object' ? item : {}),
+        images: Array.isArray(item?.images) ? [...item.images] : [],
+      }))
+    : [];
+}
+
+function getPortfolioIndexFromField(fieldName) {
+  const field = String(fieldName || '');
+  if (!field) return null;
+  if (field === 'portfolioImage' || field === 'portfolioImages') return 0;
+  if (!field.startsWith('portfolio')) return null;
+
+  const match = field.match(/^portfolio(?:Image|Images)?(\d+)(?:_(\d+))?$/);
+  if (!match) return 0;
+
+  const rawIndex = Number(match[1]);
+  if (!Number.isInteger(rawIndex) || rawIndex < 1) return 0;
+  return rawIndex - 1;
+}
+
+function mergePortfolioUploads(portfolio, files, fallback = {}) {
+  const merged = clonePortfolioItems(portfolio);
+
+  for (const file of Array.isArray(files) ? files : []) {
+    const index = getPortfolioIndexFromField(file?.fieldName || file?.field);
+    if (index === null || !file?.url) continue;
+
+    while (merged.length <= index) {
+      merged.push({
+        title: index === 0 ? (fallback.title || 'Portfolio images') : `Portfolio ${merged.length + 1}`,
+        description: index === 0 ? (fallback.description || '') : '',
+        images: [],
+        beforeAfter: false,
+      });
+    }
+
+    if (!Array.isArray(merged[index].images)) merged[index].images = [];
+    merged[index].images.push(file.url);
+  }
+
+  return merged;
+}
+
+async function buildPublicArtisanVisibilityFilter() {
+  const verifiedUsers = await User.find(
+    { $or: [{ isVerified: true }, { kycVerified: true }] },
+    '_id'
+  ).lean();
+
+  const verifiedUserIds = verifiedUsers.map((user) => user._id);
+
+  if (!verifiedUserIds.length) {
+    return { verified: true };
+  }
+
+  return {
+    $or: [
+      { verified: true },
+      { userId: { $in: verifiedUserIds } },
+    ],
+  };
+}
+
+async function resolveArtisanUserIdsForDiscovery({ categoryId, subCategoryId, terms = [] } = {}) {
+  const normalizedTerms = terms.map((term) => String(term).trim()).filter(Boolean);
+  const categoryIds = new Set(categoryId ? [String(categoryId)] : []);
+  const subCategoryIds = new Set(subCategoryId ? [String(subCategoryId)] : []);
+  const userIds = new Set();
+
+  for (const term of normalizedTerms) {
+    const esc = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(esc, 'i');
+
+    const [catMatches, subMatches, artisanMatches] = await Promise.all([
+      JobCategory.find({ name: { $regex: regex } }).select('_id').lean(),
+      JobSubCategory.find({ name: { $regex: regex } }).select('_id').lean(),
+      Artisan.find({
+        $or: [
+          { trade: { $in: [regex] } },
+          { bio: { $regex: regex } },
+          { 'serviceArea.address': { $regex: regex } },
+        ],
+      }).select('userId').lean(),
+    ]);
+
+    for (const cat of catMatches) categoryIds.add(String(cat._id));
+    for (const sub of subMatches) subCategoryIds.add(String(sub._id));
+    for (const artisan of artisanMatches) if (artisan.userId) userIds.add(String(artisan.userId));
+  }
+
+  const serviceQuery = { isActive: true };
+  if (categoryIds.size) serviceQuery.categoryId = { $in: Array.from(categoryIds) };
+  if (subCategoryIds.size) serviceQuery['services.subCategoryId'] = { $in: Array.from(subCategoryIds) };
+
+  if (categoryIds.size || subCategoryIds.size) {
+    const serviceDocs = await ArtisanService.find(serviceQuery).select('artisanId').lean();
+    for (const doc of serviceDocs) if (doc.artisanId) userIds.add(String(doc.artisanId));
+  }
+
+  if (categoryIds.size) {
+    const profileMatches = await Artisan.find({ categories: { $in: Array.from(categoryIds) } }).select('userId').lean();
+    for (const artisan of profileMatches) if (artisan.userId) userIds.add(String(artisan.userId));
+  }
+
+  return Array.from(userIds);
+}
+
 export async function listArtisans(request, reply) {
   try {
     const { page = 1, limit = 20, trade, categoryId, sortBy = 'rating', q: searchTerm, location } = request.query || {};
@@ -49,12 +179,17 @@ export async function listArtisans(request, reply) {
       if (term) {
         const terms = term.split(',').map(t => t.trim()).filter(Boolean);
         if (terms.length > 0) {
-          filters.trade = { $in: terms.map(t => new RegExp(`^${t}$`, 'i')) };
+          const matchedUserIds = await resolveArtisanUserIdsForDiscovery({ terms, categoryId });
+          if (!matchedUserIds.length) return reply.send({ success: true, data: [] });
+          filters.userId = { $in: matchedUserIds };
         }
       }
     }
-
-    if (categoryId) filters.categories = categoryId;
+    else if (categoryId) {
+      const matchedUserIds = await resolveArtisanUserIdsForDiscovery({ categoryId });
+      if (!matchedUserIds.length) return reply.send({ success: true, data: [] });
+      filters.userId = { $in: matchedUserIds };
+    }
 
     // Location filter (basic address match)
     if (location) {
@@ -63,7 +198,10 @@ export async function listArtisans(request, reply) {
 
     // Only show verified artisans to regular users; admins can see all
     const isAdmin = request.user && request.user.role === 'admin';
-    if (!isAdmin) filters.verified = true;
+    if (!isAdmin) {
+      const visibilityFilter = await buildPublicArtisanVisibilityFilter();
+      Object.assign(filters, filters.$or ? { $and: [{ ...filters }, visibilityFilter] } : visibilityFilter);
+    }
 
     console.log('listArtisans query:', filters);
     console.log('isAdmin:', isAdmin);
@@ -74,9 +212,7 @@ export async function listArtisans(request, reply) {
       .skip((page - 1) * limit)
       .limit(Number(limit))
       .exec();
-    // console.log('results count:', results.length);
-    // console.log(results);
-    const objs = results.map(r => (r && r.toObject) ? r.toObject() : r);
+    const objs = dedupeArtisansByUser(results);
     // console.log(objs);
     // Resolve linked users (if any)
     const idsToResolve = [];
@@ -275,40 +411,21 @@ export async function searchArtisans(request, reply) {
 
     // Only return verified artisans in search results for non-admins
     const isAdmin = request.user && request.user.role === 'admin';
-    if (!isAdmin) filters.verified = true;
+    if (!isAdmin) {
+      const visibilityFilter = await buildPublicArtisanVisibilityFilter();
+      Object.assign(filters, visibilityFilter);
+    }
 
     // Service-based filtering: prefer JobCategory / JobSubCategory matching via ArtisanService
     // If caller provided categoryId, subCategoryId or a free-text `q` that matches category/subcategory names,
     // resolve artisans that offer those services and restrict results to those artisans.
-    if (categoryId || subCategoryId || q) {
-      const svcQuery = { isActive: true };
-      if (categoryId) svcQuery.categoryId = categoryId;
-      if (subCategoryId) svcQuery['services.subCategoryId'] = subCategoryId;
-
-      // If q provided and no explicit category/subCategory ids, try to resolve names to ids
-      if (q && !categoryId && !subCategoryId) {
-        const terms = q.toString().split(',').map(t => t.trim()).filter(Boolean);
-        const catIds = [];
-        const subIds = [];
-        for (const t of terms) {
-          // escape user input for regex and use case-insensitive partial match
-          const esc = String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const regex = new RegExp(esc, 'i');
-          const catMatches = await JobCategory.find({ name: { $regex: regex } }).select('_id').lean();
-          for (const c of catMatches) catIds.push(String(c._id));
-          const subMatches = await JobSubCategory.find({ name: { $regex: regex } }).select('_id').lean();
-          for (const s of subMatches) subIds.push(String(s._id));
-        }
-        if (catIds.length) svcQuery.categoryId = { $in: catIds };
-        if (subIds.length) svcQuery['services.subCategoryId'] = { $in: subIds };
-      }
-
-      // Query ArtisanService to find artisans who offer these services
-      const svcDocs = await ArtisanService.find(svcQuery).select('artisanId').lean();
-      const artisanUserIds = Array.from(new Set(svcDocs.map(s => String(s.artisanId)).filter(Boolean)));
-      if (!artisanUserIds.length) return reply.send({ success: true, data: [] });
-      // Filter Artisan documents by their linked userId (which stores User._id)
-      filters.userId = { $in: artisanUserIds };
+    if (categoryId || subCategoryId || q || trade) {
+      const terms = [q, trade]
+        .filter(Boolean)
+        .flatMap((value) => String(value).split(',').map((term) => term.trim()).filter(Boolean));
+      const matchedUserIds = await resolveArtisanUserIdsForDiscovery({ categoryId, subCategoryId, terms });
+      if (!matchedUserIds.length) return reply.send({ success: true, data: [] });
+      filters.userId = { $in: matchedUserIds };
     }
 
     // If lat & lon provided, do geospatial $near query against serviceArea.coordinates
@@ -354,7 +471,7 @@ export async function searchArtisans(request, reply) {
     const query = Artisan.find(filters).sort({ [sortBy]: -1 }).skip((page - 1) * limit).limit(Number(limit));
     // const query = Artisan.find(filters).sort({ [sortBy]: -1 }).skip((page - 1) * limit).limit(Number(limit)).populate('userId', 'name profileImage');
     const results = await query.exec();
-    const objs = results.map(r => (r && r.toObject) ? r.toObject() : r);
+    const objs = dedupeArtisansByUser(results);
     // console.log(objs);
     // console.log('typeof',objs);
     const idsToResolve = [];
@@ -566,17 +683,7 @@ export async function createArtisan(request, reply) {
 
       // Add uploaded images to portfolio
       if (portfolioImages.length) {
-        if (!payload.portfolio) payload.portfolio = [];
-        if (Array.isArray(payload.portfolio) && payload.portfolio.length && Array.isArray(payload.portfolio[0]?.images)) {
-          payload.portfolio[0].images = payload.portfolio[0].images.concat(portfolioImages.map(p => p.url));
-        } else {
-          payload.portfolio.push({
-            title: 'Portfolio images',
-            description: '',
-            images: portfolioImages.map(p => p.url),
-            beforeAfter: false
-          });
-        }
+        payload.portfolio = mergePortfolioUploads(payload.portfolio, portfolioImages);
       }
     } else {
       // JSON request - portfolio images should already be uploaded and URLs included
@@ -596,7 +703,11 @@ export async function createArtisan(request, reply) {
       }
     }
 
-    const artisan = await Artisan.create(payload);
+    const artisan = await Artisan.findOneAndUpdate(
+      { userId: payload.userId },
+      payload,
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
 
     // ensure the user has artisan role
     try {
@@ -695,6 +806,7 @@ export async function updateMyArtisanProfile(request, reply) {
   try {
     const userId = request.user?.id;
     if (!userId) return reply.code(401).send({ success: false, message: 'Unauthorized' });
+    const existingArtisan = await Artisan.findOne({ userId }).lean();
 
     // Allowed fields artisans can update themselves
     const allowed = ['trade', 'categories', 'experience', 'certifications', 'bio', 'portfolio', 'serviceArea', 'pricing', 'availability'];
@@ -721,7 +833,11 @@ export async function updateMyArtisanProfile(request, reply) {
               );
               part.file.pipe(uploadStream);
             });
-            portfolioImages.push({ url: res.secure_url || res.url, public_id: res.public_id });
+            portfolioImages.push({
+              url: res.secure_url || res.url,
+              public_id: res.public_id,
+              fieldName: part.fieldname || part.field,
+            });
           } catch (err) {
             request.log?.warn?.('cloudinary portfolio upload failed', err?.message || err);
           }
@@ -739,17 +855,8 @@ export async function updateMyArtisanProfile(request, reply) {
 
       // Add uploaded images to portfolio
       if (portfolioImages.length) {
-        if (!payload.portfolio) payload.portfolio = [];
-        if (Array.isArray(payload.portfolio) && payload.portfolio.length && Array.isArray(payload.portfolio[0]?.images)) {
-          payload.portfolio[0].images = payload.portfolio[0].images.concat(portfolioImages.map(p => p.url));
-        } else {
-          payload.portfolio.push({
-            title: 'Portfolio images',
-            description: '',
-            images: portfolioImages.map(p => p.url),
-            beforeAfter: false
-          });
-        }
+        const basePortfolio = payload.portfolio || existingArtisan?.portfolio;
+        payload.portfolio = mergePortfolioUploads(basePortfolio, portfolioImages);
       }
     } else {
       // JSON request

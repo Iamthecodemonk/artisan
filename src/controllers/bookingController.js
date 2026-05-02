@@ -9,6 +9,10 @@ import axios from 'axios';
 import ArtisanService from '../models/ArtisanService.js';
 import JobSubCategory from '../models/JobSubCategory.js';
 import { sendSms as sendChampSms } from '../utils/sendchamp.js';
+import { normalizePaymentMode } from '../utils/paymentMode.js';
+import { attemptPaystackTransfer, creditArtisanWalletIfNeeded, ensurePaystackRecipient, getPayoutNotificationState, hasFinalizedPayout } from '../utils/payout.js';
+import { getPaystackCallbackUrl } from '../utils/paystack.js';
+import { formatNotificationDate, formatNotificationMoney } from '../utils/notificationText.js';
 
 function normalizePhone(phone) {
   if (!phone) return phone;
@@ -39,6 +43,98 @@ async function resolveToUserId(id) {
   } catch (e) {
     return null;
   }
+}
+
+function readNumberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const BOOKING_LOCAL_OFFSET_MINUTES = readNumberEnv('BOOKING_LOCAL_OFFSET_MINUTES', 60);
+const BOOKING_DUPLICATE_WINDOW_MS = readNumberEnv('BOOKING_DUPLICATE_WINDOW_MS', 60 * 1000);
+
+// Parse schedule input into a Date. If the incoming string has no timezone
+// information (e.g. "2024-01-02T15:00:00"), treat it as local booking time
+// in the platform timezone (WAT by default) before converting to UTC for
+// storage. This keeps "3:00 PM" from drifting by an hour on environments
+// running outside the business timezone.
+function parseSchedule(input) {
+  if (!input) return input;
+  try {
+    if (typeof input === 'string') {
+      // detect ISO-like string without timezone (no Z and no +/- offset)
+      const isoNoTz = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
+      const match = input.match(isoNoTz);
+      if (match) {
+        const [, year, month, day, hour, minute, second = '00'] = match;
+        const utcMs = Date.UTC(
+          Number(year),
+          Number(month) - 1,
+          Number(day),
+          Number(hour),
+          Number(minute),
+          Number(second)
+        ) - (BOOKING_LOCAL_OFFSET_MINUTES * 60 * 1000);
+        return new Date(utcMs);
+      }
+      return new Date(input);
+    }
+    // if it's already a Date or number, let Date handle it
+    return new Date(input);
+  } catch (e) {
+    return input;
+  }
+}
+
+function applyDirectBookingState(payload, paymentMode) {
+  if (paymentMode === 'afterCompletion') {
+    payload.paymentMode = 'afterCompletion';
+    payload.status = 'awaiting-acceptance';
+    return;
+  }
+
+  payload.paymentMode = 'upfront';
+  payload.status = 'pending';
+}
+
+async function ensureBookingChat(booking, request) {
+  try {
+    if (!booking || booking.chatId || !booking.customerId || !booking.artisanId) return booking;
+    const chat = await Chat.create({
+      bookingId: booking._id,
+      participants: [booking.customerId, booking.artisanId],
+      messages: []
+    });
+    booking.chatId = chat._id;
+    await booking.save();
+  } catch (e) {
+    request.log?.warn?.('create booking chat failed', e?.message || e);
+  }
+  return booking;
+}
+
+async function repairExistingDirectBooking(existingBooking, requestedPaymentMode, request) {
+  let changed = false;
+
+  if (requestedPaymentMode === 'afterCompletion') {
+    if (existingBooking.paymentMode !== 'afterCompletion') {
+      existingBooking.paymentMode = 'afterCompletion';
+      changed = true;
+    }
+    if (existingBooking.status === 'pending') {
+      existingBooking.status = 'awaiting-acceptance';
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    await existingBooking.save();
+  }
+
+  await ensureBookingChat(existingBooking, request);
+  return existingBooking;
 }
 
 // Orchestration: create booking + initialize payment (one-call hire endpoint)
@@ -113,13 +209,74 @@ export async function hireAndInitialize(request, reply) {
 
     if (!price || Number(price) <= 0) return reply.code(400).send({ success: false, message: 'price is required or must be resolvable from artisan services' });
 
-    const payload = { artisanId: artisanUserId, schedule, price, notes };
+    const requestedPaymentMode = normalizePaymentMode(request.body?.paymentMode);
+    if (request.body?.paymentMode && !requestedPaymentMode) return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+    const parsedSchedule = parseSchedule(schedule);
+    const payload = { artisanId: artisanUserId, schedule: parsedSchedule, price, notes };
+    // Direct bookings with deferred payment should wait for artisan acceptance.
+    applyDirectBookingState(payload, requestedPaymentMode);
     if (serviceName) payload.service = serviceName;
     if (request.body.services) payload.services = request.body.services;
     // prefer authenticated user id
     if (request.user && request.user.id) payload.customerId = request.user.id;
+    const duplicateCutoff = new Date(Date.now() - BOOKING_DUPLICATE_WINDOW_MS);
+
+    // Guard: avoid duplicate booking creation for direct hires
+    const existingBooking = await Booking.findOne({
+      customerId: payload.customerId,
+      artisanId: payload.artisanId,
+      schedule: parsedSchedule, // exact schedule match
+      price: Number(price),
+      status: { $in: ['awaiting-acceptance', 'pending', 'accepted'] }, // only check active bookings
+      createdAt: { $gte: duplicateCutoff }
+    });
+    if (existingBooking) {
+      await repairExistingDirectBooking(existingBooking, requestedPaymentMode, request);
+      return reply.code(200).send({ success: true, data: { booking: existingBooking, message: 'Booking already exists for this request' } });
+    }
 
     const booking = await Booking.create(payload);
+
+    // create a chat thread for the booking so messaging works even before payment is completed
+    await ensureBookingChat(booking, request);
+
+    if (payload.paymentMode === 'afterCompletion') {
+      (async () => {
+        try {
+          const User = (await import('../models/User.js')).default;
+          const artisanUser = await User.findById(booking.artisanId).select('phone email name').lean();
+          const artisanEmail = artisanUser?.email;
+          // Get customer name for better notification
+          let customerName = request.user?.name || null;
+          if (!customerName && booking.customerId) {
+            try { const cu = await User.findById(booking.customerId).select('name').lean(); if (cu) customerName = cu.name; } catch (e) { /* ignore */ }
+          }
+          const scheduleDate = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+          const bookingName = booking?.service || 'Booking';
+          const notificationBody = `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleDate}. Customer: ${customerName || 'N/A'}.`;
+          await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking awaiting acceptance', body: notificationBody, data: { bookingId: booking._id, bookingName, sendEmail: true, email: artisanEmail } });
+          try {
+            const artisanPhone = normalizePhone(artisanUser?.phone);
+            let customerPhone = normalizePhone(request.user?.phone || null);
+            if (!customerPhone && booking.customerId) {
+              try { const cu = await User.findById(booking.customerId).select('phone').lean(); 
+                if (cu) { 
+                  customerPhone = normalizePhone(cu.phone); } } catch (e) { /* ignore */ }
+            }
+            if (artisanPhone) {
+              const msg = `New booking: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
+              await sendChampSms(artisanPhone, msg);
+            }
+          } catch (smsErr) {
+            request.log?.warn?.('async send SMS to artisan failed', smsErr?.message || smsErr);
+          }
+        } catch (e) {
+          request.log?.warn?.('async notify artisan on booking failed', e?.message || e);
+        }
+      })();
+
+      return reply.code(201).send({ success: true, message: 'Booking created with deferred payment; payment will be collected after completion.', data: { booking } });
+    }
 
     // NOTE: notification moved below to run after payment initialization
 
@@ -131,17 +288,24 @@ export async function hireAndInitialize(request, reply) {
           const User = (await import('../models/User.js')).default;
           const artisanUser = await User.findById(booking.artisanId).select('phone email name').lean();
           const artisanEmail = artisanUser?.email;
-          await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking', body: `A new booking (${booking._id}) was created.`, data: { bookingId: booking._id, sendEmail: true, email: artisanEmail } });
+          // Get customer name for better notification
+          let customerName = request.user?.name || null;
+          if (!customerName && booking.customerId) {
+            try { const cu = await User.findById(booking.customerId).select('name').lean(); if (cu) customerName = cu.name; } catch (e) { /* ignore */ }
+          }
+          const scheduleDate = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+          const bookingName = booking?.service || 'Booking';
+          const notificationBody = `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleDate}. Customer: ${customerName || 'N/A'}.`;
+          await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking', body: notificationBody, data: { bookingId: booking._id, bookingName, sendEmail: true, email: artisanEmail } });
           try {
             const artisanPhone = normalizePhone(artisanUser?.phone);
             // try to obtain customer info from request.user or booking payload
-            let customerName = request.user?.name || null;
             let customerPhone = normalizePhone(request.user?.phone || null);
-            if (!customerName && booking.customerId) {
-              try { const cu = await User.findById(booking.customerId).select('name phone').lean(); if (cu) { customerName = cu.name; customerPhone = normalizePhone(cu.phone); } } catch (e) { /* ignore */ }
+            if (!customerPhone && booking.customerId) {
+              try { const cu = await User.findById(booking.customerId).select('phone').lean(); if (cu) { customerPhone = normalizePhone(cu.phone); } } catch (e) { /* ignore */ }
             }
             if (artisanPhone) {
-              const msg = `New booking ${booking._id}\nService: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
+              const msg = `New booking: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
               await sendChampSms(artisanPhone, msg);
             }
           } catch (smsErr) {
@@ -157,10 +321,12 @@ export async function hireAndInitialize(request, reply) {
 
     // initialize paystack transaction
     const amountInKobo = Math.round(Number(price) * 100);
+    const callbackUrl = getPaystackCallbackUrl();
     const res = await axios.post('https://api.paystack.co/transaction/initialize', {
       email,
       amount: amountInKobo,
-      metadata: { bookingId: booking._id, customerCoords }
+      metadata: { bookingId: booking._id, customerCoords },
+      callback_url: callbackUrl
     }, {
       headers: {
         Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
@@ -178,9 +344,17 @@ export async function hireAndInitialize(request, reply) {
     (async () => {
       try {
         const User = (await import('../models/User.js')).default;
-        const artisanUser = await User.findById(booking.artisanId);
+        const artisanUser = await User.findById(booking.artisanId).select('phone email name').lean();
         const artisanEmail = artisanUser?.email;
-        await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking', body: `A new booking (${booking._id}) was created.`, data: { bookingId: booking._id, sendEmail: true, email: artisanEmail } });
+        // Get customer name for better notification
+        let customerName = request.user?.name || null;
+        if (!customerName && booking.customerId) {
+          try { const cu = await User.findById(booking.customerId).select('name').lean(); if (cu) customerName = cu.name; } catch (e) { /* ignore */ }
+        }
+        const scheduleDate = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+        const bookingName = booking?.service || 'Booking';
+        const notificationBody = `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleDate}. Customer: ${customerName || 'N/A'}. Payment pending.`;
+        await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking - payment pending', body: notificationBody, data: { bookingId: booking._id, bookingName, sendEmail: true, email: artisanEmail } });
         try {
           const artisanPhone = artisanUser?.phone;
           if (artisanPhone) {
@@ -190,7 +364,7 @@ export async function hireAndInitialize(request, reply) {
             if (!customerName && booking.customerId) {
               try { const cu = await User.findById(booking.customerId).select('name phone').lean(); if (cu) { customerName = cu.name; customerPhone = normalizePhone(cu.phone); } } catch (e) { /* ignore */ }
             }
-            const msg = `New booking ${booking._id}\nService: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
+            const msg = `New booking: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
             await sendChampSms(artisanPhone, msg);
           }
         } catch (smsErr) {
@@ -312,6 +486,12 @@ export async function getArtisanBookings(request, reply) {
 export async function createBooking(request, reply) {
   try {
     const payload = request.body || {};
+    // Normalize schedule to Date and avoid timezone-less offset issues
+    if (payload.schedule) payload.schedule = parseSchedule(payload.schedule);
+    const requestedPaymentMode = normalizePaymentMode(payload.paymentMode);
+    if (payload.paymentMode && !requestedPaymentMode) return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+    // Direct bookings with deferred payment should wait for artisan acceptance.
+    applyDirectBookingState(payload, requestedPaymentMode);
     // If multiple services provided, compute server-side total using ArtisanService pricing
     if (Array.isArray(payload.services) && payload.services.length > 0) {
       // normalize incoming artisan id to User._id
@@ -361,13 +541,32 @@ export async function createBooking(request, reply) {
         }
       }
     }
+    const duplicateCutoff = new Date(Date.now() - BOOKING_DUPLICATE_WINDOW_MS);
+
+    // Guard: avoid duplicate booking creation for direct bookings
+    const existingBooking = await Booking.findOne({
+      customerId: payload.customerId,
+      artisanId: payload.artisanId,
+      schedule: payload.schedule ? payload.schedule : undefined,
+      price: payload.price ? Number(payload.price) : undefined,
+      status: { $in: ['awaiting-acceptance', 'pending', 'accepted'] }, // only check active bookings
+      createdAt: { $gte: duplicateCutoff }
+    });
+    if (existingBooking) {
+      await repairExistingDirectBooking(existingBooking, requestedPaymentMode, request);
+      return reply.code(200).send({ success: true, data: { booking: existingBooking, message: 'Booking already exists for this request' } });
+    }
 
     const booking = await Booking.create(payload);
+
+    // create a chat thread for the booking so messaging works even before payment is completed
+    await ensureBookingChat(booking, request);
+
     // notify artisan asynchronously (non-blocking)
     (async () => {
       try {
         const User = (await import('../models/User.js')).default;
-        const artisanUser = await User.findById(booking.artisanId);
+        const artisanUser = await User.findById(booking.artisanId).select('name email phone').lean();
         const artisanPhone = artisanUser?.phone;
         if (artisanPhone) {
           // attempt to include customer info
@@ -376,10 +575,22 @@ export async function createBooking(request, reply) {
           if (!customerName && booking.customerId) {
             try { const cu = await User.findById(booking.customerId).select('name phone').lean(); if (cu) { customerName = cu.name; customerPhone = normalizePhone(cu.phone); } } catch (e) { /* ignore */ }
           }
-          const msg = `New booking ${booking._id}\nService: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
+          const msg = `New booking: ${booking.service || 'N/A'}\nAmount: ${booking.price || 'N/A'}\nSchedule: ${booking.schedule || 'N/A'}\nCustomer: ${customerName || 'N/A'} ${customerPhone ? '(' + customerPhone + ')' : ''}\nNotes: ${booking.notes || ''}`;
           await sendChampSms(artisanPhone, msg);
         }
-        await createNotification(request.server, booking.artisanId, { type: 'booking', title: 'New booking', body: `A new booking (${booking._id}) was created.`, data: { bookingId: booking._id } });
+        // Build notification message with booking details
+        let notificationTitle = 'New booking';
+        let notificationBody = `A new booking created.`;
+        if (booking.paymentMode === 'afterCompletion') {
+          notificationTitle = 'New booking awaiting your acceptance';
+          const scheduleDate = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+          let customerName = request.user?.name || null;
+          if (!customerName && booking.customerId) {
+            try { const cu = await User.findById(booking.customerId).select('name').lean(); if (cu) customerName = cu.name; } catch (e) { /* ignore */ }
+          }
+          notificationBody = `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleDate}. Customer: ${customerName || 'N/A'}.`;
+        }
+        await createNotification(request.server, booking.artisanId, { type: 'booking', title: notificationTitle, body: notificationBody, data: { bookingId: booking._id } });
       } catch (e) {
         request.log?.warn?.('async notify artisan on createBooking failed', e?.message || e);
       }
@@ -389,6 +600,56 @@ export async function createBooking(request, reply) {
   } catch (err) {
     request.log?.error?.(err);
     return reply.code(400).send({ success: false, message: err.message });
+  }
+}
+
+export async function initiateDeferredPayment(request, reply) {
+  try {
+    const booking = await Booking.findById(request.params.id).populate('customerId artisanId');
+    if (!booking) return reply.code(404).send({ success: false, message: 'Booking not found' });
+    if (booking.paymentMode !== 'afterCompletion') return reply.code(400).send({ success: false, message: 'Booking is not configured for deferred payment' });
+    if (booking.paymentStatus === 'paid') return reply.code(400).send({ success: false, message: 'Booking is already paid' });
+    if (booking.status !== 'completed') return reply.code(400).send({ success: false, message: 'Payment after completion is only available for completed bookings' });
+
+    const existingTx = await Transaction.findOne({ bookingId: booking._id, status: { $in: ['pending', 'holding'] } });
+    if (existingTx) {
+      const message = existingTx.status === 'holding'
+        ? 'Deferred payment already initialized and waiting for completion release.'
+        : 'Deferred payment already initialized; use the existing transaction reference to complete payment.';
+      return reply.code(200).send({ success: true, message, data: { booking, transaction: existingTx } });
+    }
+
+    const email = request.body?.email || booking.customerId?.email;
+    if (!email) return reply.code(400).send({ success: false, message: 'Email required to initialize payment' });
+
+    if (!process.env.PAYSTACK_SECRET_KEY) {
+      const tx = await Transaction.create({ bookingId: booking._id, payerId: request.user?.id || booking.customerId?._id || null, amount: Number(booking.price) || 0, status: 'pending', paymentGatewayRef: null });
+      return reply.code(201).send({ success: true, message: 'Deferred payment recorded; Paystack is not configured.', data: { booking, transaction: tx } });
+    }
+
+    const amountInKobo = Math.round(Number(booking.price || 0) * 100);
+    const callbackUrl = getPaystackCallbackUrl();
+    const res = await axios.post('https://api.paystack.co/transaction/initialize', {
+      email,
+      amount: amountInKobo,
+      metadata: { bookingId: booking._id, customerCoords: request.body?.customerCoords },
+      callback_url: callbackUrl
+    }, {
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const init = res?.data?.data;
+    if (init) {
+      await Transaction.create({ bookingId: booking._id, payerId: request.user?.id || booking.customerId?._id || null, amount: Number(booking.price) || 0, status: 'pending', paymentGatewayRef: init.reference });
+    }
+
+    return reply.code(201).send({ success: true, data: { booking, payment: res.data.data } });
+  } catch (err) {
+    request.log?.error?.(err?.response?.data || err?.message || err);
+    return reply.code(500).send({ success: false, message: 'Failed to initiate deferred payment' });
   }
 }
 
@@ -445,7 +706,8 @@ export async function cancelBooking(request, reply) {
             // keep paymentStatus aligned with Booking schema ("unpaid" or "paid").
             booking.paymentStatus = 'unpaid';
             await booking.save();
-            await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund processed', body: `Refund for booking ${booking._id} processed.`, data: { bookingId: booking._id } });
+            const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+            await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund processed', body: `${formatNotificationMoney(booking.price)} refund for ${booking.service || 'Service'} on ${scheduleStr} has been processed.`, data: { bookingId: booking._id } });
             return reply.send({ success: true, message: 'Cancelled and refund processed', data: booking, gateway: res.data });
           }
           // if gateway returned non-success, mark requested and notify
@@ -454,14 +716,16 @@ export async function cancelBooking(request, reply) {
           tx.refundId = res.data.data?.id || res.data.data?.reference || res.data.data?.refund_id || tx.refundId;
           tx.refundStatus = tx.refundStatus || 'requested';
           await tx.save();
-          await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund requested', body: `Refund for booking ${booking._id} requested; gateway did not confirm immediate refund.`, data: { bookingId: booking._id } });
+          const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+          await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund requested', body: `${formatNotificationMoney(booking.price)} refund for ${booking.service || 'Service'} on ${scheduleStr} has been requested. Processing may take 3 to 5 business days.`, data: { bookingId: booking._id } });
           return reply.send({ success: true, message: 'Cancelled; refund requested (gateway did not confirm)', data: booking, gateway: res.data });
         } catch (err) {
           request.log?.error?.('refund failed', err?.response?.data || err?.message);
           // store that a refund was requested for manual reconciliation
           tx.refundStatus = 'requested';
           await tx.save();
-          await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund requested', body: `Refund for booking ${booking._id} requested; manual processing required.`, data: { bookingId: booking._id } });
+          const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+          await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund requested', body: `${formatNotificationMoney(booking.price)} refund for ${booking.service || 'Service'} on ${scheduleStr} is under review. We will update you within 48 hours.`, data: { bookingId: booking._id } });
           return reply.send({ success: true, message: 'Cancelled; refund requested (gateway attempt failed)', data: booking });
         }
       }
@@ -474,7 +738,8 @@ export async function cancelBooking(request, reply) {
       booking.status = 'cancelled';
       booking.paymentStatus = 'unpaid';
       await booking.save();
-      await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund processed', body: `Refund for booking ${booking._id} processed (internal).`, data: { bookingId: booking._id } });
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+      await createNotification(request.server, booking.customerId._id, { type: 'refund', title: 'Refund processed', body: `${formatNotificationMoney(booking.price)} refund for ${booking.service || 'Service'} on ${scheduleStr} has been credited.`, data: { bookingId: booking._id } });
       return reply.send({ success: true, message: 'Cancelled and refund processed (internal)', data: booking });
     }
 
@@ -482,6 +747,52 @@ export async function cancelBooking(request, reply) {
     booking.status = 'cancelled';
     await booking.save();
     return reply.send({ success: true, message: 'Cancelled', data: booking });
+  } catch (err) {
+    request.log?.error?.(err);
+    return reply.code(400).send({ success: false, message: err.message });
+  }
+}
+
+export async function artisanCancelBooking(request, reply) {
+  try {
+    const reason = request.body?.reason;
+    if (!reason || typeof reason !== 'string' || !reason.trim()) {
+      return reply.code(400).send({ success: false, message: 'Cancellation reason is required' });
+    }
+
+    const booking = await Booking.findById(request.params.id).populate('customerId artisanId');
+    if (!booking) return reply.code(404).send({ success: false, message: 'Booking not found' });
+    if (String(booking.artisanId._id) !== String(request.user?.id)) return reply.code(403).send({ success: false, message: 'Forbidden' });
+    if (booking.paymentMode !== 'afterCompletion') return reply.code(400).send({ success: false, message: 'Artisan cancellation is only allowed for after-completion bookings' });
+    if (booking.status === 'completed' || booking.paymentStatus === 'paid') return reply.code(400).send({ success: false, message: 'Cannot cancel a completed or already-paid booking' });
+    if (booking.status === 'cancelled') return reply.code(400).send({ success: false, message: 'Booking is already cancelled' });
+
+    const tx = await Transaction.findOne({ bookingId: booking._id, status: { $in: ['pending', 'holding'] } });
+    if (tx) {
+      tx.status = 'refunded';
+      tx.refundStatus = 'refunded';
+      await tx.save();
+    }
+
+    booking.status = 'cancelled';
+    booking.paymentStatus = 'unpaid';
+    booking.cancellationReason = reason.trim();
+    booking.cancelledBy = 'artisan';
+    await booking.save();
+
+    try {
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+      await createNotification(request.server, booking.customerId._id, {
+        type: 'booking',
+        title: 'Booking cancelled by artisan',
+        body: `Your ${booking.service || 'service'} booking for ${formatNotificationMoney(booking.price)} on ${scheduleStr} was cancelled. Reason: ${booking.cancellationReason}. A full refund will be issued.`,
+        data: { bookingId: booking._id }
+      });
+    } catch (e) {
+      request.log?.warn?.('artisanCancelBooking: failed to notify customer', e?.message || e);
+    }
+
+    return reply.send({ success: true, message: 'Booking cancelled by artisan', data: booking });
   } catch (err) {
     request.log?.error?.(err);
     return reply.code(400).send({ success: false, message: err.message });
@@ -529,16 +840,61 @@ export async function completeBooking(request, reply) {
     const booking = await Booking.findById(request.params.id).populate('customerId artisanId');
     if (!booking) return reply.code(404).send({ success: false, message: 'Not found' });
     if (String(booking.customerId._id) !== String(request.user?.id)) return reply.code(403).send({ success: false, message: 'Forbidden' });
-    if (!['in-progress', 'accepted'].includes(booking.status)) return reply.code(400).send({ success: false, message: 'Invalid booking state' });
+    if (booking.status === 'completed' || booking.status === 'closed') {
+      return reply.send({ success: true, message: 'Booking already completed', data: booking });
+    }
+    if (!['in-progress', 'accepted'].includes(booking.status)) {
+      return reply.code(400).send({
+        success: false,
+        message: `Booking cannot be completed from status: ${booking.status}`
+      });
+    }
+
+    // Guard: for afterCompletion bookings, ensure payment has at least been initiated
+    // Skip check if payment is not required (e.g., free bookings, internal jobs, or admin override)
+    const skipPaymentCheck = request.query?.skipPayment === 'true' || request.query?.noPayment === 'true' ||
+                            booking.price === 0 || booking.price === null || booking.price === undefined;
+    if (booking.paymentMode === 'afterCompletion' && !skipPaymentCheck) {
+      const hasPaidTx = await Transaction.findOne({ bookingId: booking._id, status: 'holding' });
+      const hasInitiatedPayment = await Transaction.findOne({ bookingId: booking._id, status: 'pending', paymentGatewayRef: { $exists: true, $ne: null } });
+
+      if (!hasPaidTx && !hasInitiatedPayment) {
+        return reply.code(400).send({
+          success: false,
+          message: 'Payment must be initialized before marking work as complete. Use POST /booking/:id/pay-after-completion to initialize payment, or add ?skipPayment=true for no-payment completion.'
+        });
+      }
+    }
 
     // mark booking completed when customer marks it complete
     booking.status = 'completed';
     booking.awaitingReview = true;
     await booking.save();
 
+    // If payment has already been initialized but webhook/verification has not updated the transaction,
+    // attempt to verify any pending Paystack transaction before release.
+    let tx = await Transaction.findOne({ bookingId: booking._id, status: 'holding' });
+    if (!tx && booking.paymentMode === 'afterCompletion' && process.env.PAYSTACK_SECRET_KEY) {
+      const pendingTx = await Transaction.findOne({ bookingId: booking._id, status: 'pending', paymentGatewayRef: { $exists: true, $ne: null } });
+      if (pendingTx) {
+        try {
+          const res = await axios.get(`https://api.paystack.co/transaction/verify/${encodeURIComponent(pendingTx.paymentGatewayRef)}`, {
+            headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` }
+          });
+          const success = res?.data?.status === true && ['success', 'paid'].includes((res.data.data?.status || '').toLowerCase());
+          if (success) {
+            pendingTx.status = 'holding';
+            await pendingTx.save();
+            tx = pendingTx;
+          }
+        } catch (e) {
+          request.log?.warn?.('Failed to verify pending deferred payment on booking completion', e?.response?.data || e?.message || e);
+        }
+      }
+    }
+
     // release payment if transaction in holding
-    const tx = await Transaction.findOne({ bookingId: booking._id, status: 'holding' });
-    if (tx) {
+    if (tx && (tx.status === 'holding' || tx.status === 'released') && !hasFinalizedPayout(tx) && !tx.transferRef) {
       let feePct = 0;
       try {
         const cfgVal = await getConfig('COMPANY_FEE_PCT');
@@ -550,17 +906,14 @@ export async function completeBooking(request, reply) {
       const fee = Math.round((tx.amount * feePct) / 100 * 100) / 100;
       const payAmount = tx.amount - fee;
       tx.companyFee = fee;
-      // mark transaction as paid (payout completed or credited to wallet)
-      tx.status = 'paid';
-      tx.releasedAt = new Date();
+      tx.status = 'released';
+      tx.releasedAt = tx.releasedAt || new Date();
       await tx.save();
 
       // Determine whether to auto-payout via Paystack or credit internal wallet
       const autoPayout = String(process.env.PAYSTACK_AUTO_PAYOUT || '').toLowerCase() === 'true';
 
       // If auto-payout is enabled and Paystack configured and artisan has recipient code, attempt transfer
-      let transferAttempted = false;
-      let transferSucceeded = false;
       const artisanDoc = await Artisan.findOne({ userId: booking.artisanId._id });
       // Prefer recipient code stored on the artisan's wallet; fall back to artisan doc
       let wallet = await Wallet.findOne({ userId: booking.artisanId._id });
@@ -569,74 +922,19 @@ export async function completeBooking(request, reply) {
       let recipientCode = wallet?.paystackRecipientCode || artisanDoc?.paystackRecipientCode || null;
 
       // If we have payoutDetails but no recipientCode, try to create a Paystack recipient (server-side)
-      if (!recipientCode && process.env.PAYSTACK_SECRET_KEY && wallet?.payoutDetails && wallet.payoutDetails.account_number && wallet.payoutDetails.bank_code && wallet.payoutDetails.name) {
-        try {
-          const pr = await axios.post('https://api.paystack.co/transferrecipient', {
-            type: 'nuban',
-            name: wallet.payoutDetails.name,
-            account_number: wallet.payoutDetails.account_number,
-            bank_code: wallet.payoutDetails.bank_code,
-            currency: wallet.payoutDetails.currency || 'NGN'
-          }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
-          const pData = pr?.data?.data;
-          if (pData && pData.recipient_code) {
-            recipientCode = pData.recipient_code;
-            // persist recipient code on wallet and artisan for compatibility
-            wallet.paystackRecipientCode = recipientCode;
-            wallet.paystackRecipientMeta = pData;
-            await wallet.save();
-            try {
-              if (artisanDoc) {
-                artisanDoc.paystackRecipientCode = recipientCode;
-                artisanDoc.paystackRecipientMeta = pData;
-                await artisanDoc.save();
-              }
-            } catch (e) { request.log?.warn?.('failed to update artisan with recipient code', e?.message || e); }
-          }
-        } catch (e) {
-          request.log?.error?.('create paystack recipient failed', e?.response?.data || e?.message || e);
-        }
-      }
+      if (!recipientCode) recipientCode = await ensurePaystackRecipient({ wallet, artisanDoc, request });
 
+      let transferResult = { attempted: false, finalized: false, succeeded: false };
       if (autoPayout && process.env.PAYSTACK_SECRET_KEY && recipientCode) {
-        transferAttempted = true;
-        try {
-          const amountKobo = Math.round(payAmount * 100);
-          const tRes = await axios.post('https://api.paystack.co/transfer', {
-            source: 'balance',
-            amount: amountKobo,
-            recipient: recipientCode,
-            reason: `Payout for booking ${booking._id}`
-          }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
-
-          if (tRes?.data?.status === true) {
-            // persist transfer reference and amount
-            tx.transferRef = tRes.data.data?.transfer_code || tRes.data.data?.reference || tRes.data.data?.id;
-            tx.transferAmount = payAmount;
-            tx.transferStatus = tRes.data.data?.status || 'pending';
-            await tx.save();
-            transferSucceeded = ['success', 'processed', 'queued', 'pending'].includes((tx.transferStatus || '').toLowerCase());
-          }
-        } catch (e) {
-          request.log?.error?.('auto payout failed', e?.response?.data || e?.message || e);
-          // store pending transfer attempt status for manual reconciliation
-          tx.transferStatus = tx.transferStatus || 'failed';
-          await tx.save();
-        }
+        transferResult = await attemptPaystackTransfer({ tx, booking, payAmount, recipientCode, request });
       }
 
       // If not using auto-payout or auto-payout failed, credit internal artisan wallet
-      if (!autoPayout || (!transferAttempted) || (transferAttempted && !transferSucceeded)) {
-        let wallet = await Wallet.findOne({ userId: booking.artisanId._id });
-        if (!wallet) wallet = await Wallet.create({ userId: booking.artisanId._id });
-        wallet.balance = (wallet.balance || 0) + payAmount;
-        wallet.totalEarned = (wallet.totalEarned || 0) + payAmount;
-        wallet.totalJobs = (wallet.totalJobs || 0) + 1;
-        wallet.lastUpdated = new Date();
-        await wallet.save();
-        // mark tx as paid when wallet credited
+      if (transferResult.finalized && transferResult.succeeded) {
         tx.status = 'paid';
         await tx.save();
+      } else if (!autoPayout || !transferResult.attempted || (transferResult.attempted && !transferResult.succeeded && !transferResult.inFlight)) {
+        await creditArtisanWalletIfNeeded({ tx, wallet, payAmount });
       }
 
       // Record company/platform commission and optionally credit company wallet
@@ -657,7 +955,7 @@ export async function completeBooking(request, reply) {
               companyWallet.lastUpdated = new Date();
               await companyWallet.save();
               // notify company/admin account if possible
-              try { await createNotification(request.server, companyUserId, { type: 'commission', title: 'Commission received', body: `Commission of ${fee} credited for booking ${booking._id}`, data: { bookingId: booking._id, amount: fee } }); } catch (e) { request.log?.warn?.('company notify failed', e?.message); }
+              try { await createNotification(request.server, companyUserId, { type: 'commission', title: 'Commission received', body: `${formatNotificationMoney(fee)} commission received from ${booking.service || 'service'}.`, data: { bookingId: booking._id, amount: fee } }); } catch (e) { request.log?.warn?.('company notify failed', e?.message); }
             } catch (e) { request.log?.error?.('credit company wallet failed', e?.message || e); }
           }
         }
@@ -678,17 +976,19 @@ export async function completeBooking(request, reply) {
       const artisanEmail = booking.artisanId?.email;
       const customerEmail = booking.customerId?.email;
       const paidAmount = (tx && (tx.amount - tx.companyFee)) || null;
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
+      const payoutNotice = getPayoutNotificationState(tx);
       await createNotification(request.server, booking.artisanId._id, {
         type: 'job_complete',
-        title: 'Job completed — payment sent',
-        body: `The job ${booking._id} was completed. ${paidAmount !== null ? `You received ${paidAmount}.` : ''} Thank you!`,
-        data: { bookingId: booking._id, amount: paidAmount, sendEmail: true, email: artisanEmail }
+        title: payoutNotice.artisanTitle,
+        body: `${booking.service || 'Service'} completed. ${paidAmount !== null ? `Amount: ${formatNotificationMoney(paidAmount)}.` : ''} ${payoutNotice.artisanBodySuffix}`,
+        data: { bookingId: booking._id, amount: paidAmount, sendEmail: true, email: artisanEmail, transferStatus: tx?.transferStatus, payoutStatus: tx?.status }
       });
       await createNotification(request.server, booking.customerId._id, {
         type: 'job_complete',
-        title: 'Job completed — thank you',
-        body: `Your job ${booking._id} has been marked complete and the artisan has been paid. Please leave a review.`,
-        data: { bookingId: booking._id, sendEmail: true, email: customerEmail }
+        title: payoutNotice.customerTitle,
+        body: `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleStr} is complete. ${payoutNotice.customerBodySuffix} Please leave a review.`,
+        data: { bookingId: booking._id, sendEmail: true, email: customerEmail, transferStatus: tx?.transferStatus, payoutStatus: tx?.status }
       });
     } catch (e) {
       request.log?.warn?.('notify parties failed', e?.message || e);
@@ -759,11 +1059,13 @@ export async function confirmPayment(request, reply) {
     await booking.save();
 
     // notify artisan that payment was received and needs their acceptance
-    try { 
+    try {
+      const customerName = booking.customerId?.name || 'Customer';
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
       await createNotification(request.server, booking.artisanId._id, { 
         type: 'booking', 
-        title: 'New booking awaiting your acceptance', 
-        body: `Payment for booking ${booking._id} received. Please accept or reject within 24 hours.`, 
+        title: 'New booking awaiting acceptance', 
+        body: `${booking.service || 'Service'} for ${formatNotificationMoney(booking.price)} on ${scheduleStr} from ${customerName}. Payment received. Please accept or reject within 24 hours.`, 
         data: { bookingId: booking._id } 
       }); 
     } catch (e) { 
@@ -793,8 +1095,8 @@ export async function acceptBooking(request, reply) {
       return reply.code(400).send({ success: false, message: `Cannot accept booking with status: ${booking.status}` });
     }
 
-    // Check if payment is confirmed
-    if (booking.paymentStatus !== 'paid') {
+    // Check if payment is confirmed for upfront bookings
+    if (booking.paymentMode !== 'afterCompletion' && booking.paymentStatus !== 'paid') {
       return reply.code(400).send({ success: false, message: 'Payment not confirmed yet' });
     }
 
@@ -806,10 +1108,12 @@ export async function acceptBooking(request, reply) {
 
     // Notify customer
     try {
+      const artisanName = booking.artisanId?.name || 'The artisan';
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
       await createNotification(request.server, booking.customerId._id, {
         type: 'booking',
         title: 'Booking accepted',
-        body: `Your booking ${booking._id} has been accepted by the artisan. Work will begin as scheduled.`,
+        body: `${artisanName} accepted your ${booking.service || 'service'} booking for ${formatNotificationMoney(booking.price)}. Work starts on ${scheduleStr}.`,
         data: { bookingId: booking._id }
       });
     } catch (e) {
@@ -878,10 +1182,12 @@ export async function rejectBooking(request, reply) {
 
     // Notify customer
     try {
+      const artisanName = booking.artisanId?.name || 'The artisan';
+      const scheduleStr = booking.schedule ? formatNotificationDate(booking.schedule) : 'TBD';
       await createNotification(request.server, booking.customerId._id, {
         type: 'booking',
         title: 'Booking declined',
-        body: `Your booking ${booking._id} was declined by the artisan. ${booking.refundStatus === 'refunded' ? 'Refund has been processed.' : 'Refund will be processed shortly.'}`,
+        body: `${artisanName} declined your ${booking.service || 'service'} booking for ${formatNotificationMoney(booking.price)} on ${scheduleStr}. Reason: ${booking.rejectionReason}. ${booking.refundStatus === 'refunded' ? 'Your refund has been processed.' : 'Your refund will be processed within 3 to 5 business days.'}`,
         data: { bookingId: booking._id, reason: booking.rejectionReason }
       });
     } catch (e) {

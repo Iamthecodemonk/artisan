@@ -2,6 +2,13 @@ import Kyc from '../models/Kyc.js';
 import User from '../models/User.js';
 import cloudinary from '../utils/cloudinary.js';
 
+function getUserKycFlags(status) {
+  if (status === 'approved') {
+    return { kycLevel: 2, kycVerified: true, isVerified: true };
+  }
+  return { kycLevel: 1, kycVerified: false, isVerified: false };
+}
+
 export async function submitKyc(request, reply) {
   try {
     const payload = request.body || {};
@@ -94,12 +101,7 @@ export async function submitKyc(request, reply) {
     try {
       const uid = request.user?.id || payload.userId;
       if (uid) {
-        const update = { kycLevel: 1 };
-        if (kyc.status === 'approved') {
-          update.kycVerified = true;
-          update.isVerified = true;
-        }
-        await User.findByIdAndUpdate(uid, { $set: update });
+        await User.findByIdAndUpdate(uid, { $set: getUserKycFlags(kyc.status) });
       }
     } catch (err) {
       request.log?.warn?.({ err: err?.message || err, reqId: request.id }, 'failed to update user kyc flags');

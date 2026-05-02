@@ -378,7 +378,7 @@ export const loginUser = async (req, reply) => {
     const normalizedEmail = email.toLowerCase().trim();
     
     // Try to find a normal User first
-    const user = await User.findOne({ email: normalizedEmail });
+    const user = await User.findOne({ email: normalizedEmail }).select('+password');
     if (user && user.banned) return reply.code(403).send({ message: 'Account banned' });
     if (user) {
       const match = await bcrypt.compare(password, user.password || '');

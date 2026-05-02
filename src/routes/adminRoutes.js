@@ -1,5 +1,25 @@
-// import {  } from '../controllers/adminController.js';
-import { adminListJobs,adminOverview, listUsers, updateUserRole, createAdmin, listAdmins, centralFeed, adminListBookings, adminListQuotes, adminListChats, adminGetChat, adminListWallets, adminGetWallet, listArtisans, banUser, unbanUser } from '../controllers/adminController.js';
+import {
+  adminGetChat,
+  adminDeleteKycFile,
+  adminDeleteUserProfileImage,
+  adminGetWallet,
+  adminListBookings,
+  adminListChats,
+  adminListJobs,
+  adminListQuotes,
+  adminListSpecialRequests,
+  adminListWallets,
+  adminOverview,
+  banUser,
+  centralFeed,
+  createAdmin,
+  listAdmins,
+  listArtisans,
+  listUsers,
+  unbanUser,
+  updateUserRole,
+  upsertArtisanProfile,
+} from '../controllers/adminController.js';
 import { listConfigs, getConfigByKey, upsertConfig } from '../controllers/configController.js';
 import { listCompanyEarnings, summaryCompanyEarnings } from '../controllers/companyEarningController.js';
 import { verifyJWT } from '../middlewares/auth.js';
@@ -10,29 +30,57 @@ export default async function adminRoutes(fastify, opts) {
   const idParams = { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } };
 
   const roleSchema = { body: { type: 'object', required: ['role'], properties: { role: { type: 'string', enum: ['user', 'artisan', 'admin'] } } } };
+  const specialRequestListSchema = {
+    querystring: {
+      type: 'object',
+      properties: {
+        page: { type: 'integer', minimum: 1 },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+        status: { type: 'string' },
+        clientId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' },
+        artisanId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' },
+        q: { type: 'string' },
+        includeBooking: { type: 'string', enum: ['true', 'false'] },
+      },
+    },
+  };
+  const userIdParams = { params: { type: 'object', required: ['userId'], properties: { userId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } };
+  const kycDeleteSchema = {
+    ...userIdParams,
+    querystring: {
+      type: 'object',
+      required: ['field'],
+      properties: {
+        field: { type: 'string', enum: ['IdUploadFront', 'IdUploadBack', 'profileImage'] },
+      },
+    },
+  };
 
-  fastify.get('/overview', { preHandler: verifyJWT }, adminOverview);
+  fastify.get('/overview', { preHandler: [verifyJWT, requireRole('admin')] }, adminOverview);
   // Central aggregated feed for dashboards (role-aware)
   fastify.get('/central', { preHandler: verifyJWT }, centralFeed);
   fastify.get('/users', { preHandler: verifyJWT }, listUsers);
   // Admin: list artisans with enriched profiles (admin only)
   fastify.get('/artisans', { preHandler: [verifyJWT, requireRole('admin')] }, listArtisans);
   // Admin: create or update artisan profile for a user
-  fastify.put('/artisans/:userId', { preHandler: [verifyJWT, requireRole('admin')], schema: { params: { type: 'object', required: ['userId'], properties: { userId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } } }, async (request, reply) => {
-    const { upsertArtisanProfile } = await import('../controllers/adminController.js');
+  fastify.put('/artisans/:userId', { preHandler: [verifyJWT, requireRole('admin'), (request, reply) => import('../middlewares/cloudinaryStream.js').then(m => m.default(request, reply))], schema: userIdParams }, async (request, reply) => {
     return upsertArtisanProfile(request, reply);
   });
+  // Admin: delete a user's profile image
+  fastify.delete('/artisans/:userId/profile-image', { preHandler: [verifyJWT, requireRole('admin')], schema: userIdParams }, adminDeleteUserProfileImage);
 
   // Admin: upsert KYC and get KYC
-  fastify.put('/kyc/:userId', { preHandler: [verifyJWT, requireRole('admin')], schema: { params: { type: 'object', required: ['userId'], properties: { userId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } } }, async (request, reply) => {
+  fastify.put('/kyc/:userId', { preHandler: [verifyJWT, requireRole('admin'), (request, reply) => import('../middlewares/cloudinaryStream.js').then(m => m.default(request, reply))], schema: userIdParams }, async (request, reply) => {
     const { upsertKyc } = await import('../controllers/adminController.js');
     return upsertKyc(request, reply);
   });
 
-  fastify.get('/kyc/:userId', { preHandler: [verifyJWT, requireRole('admin')], schema: { params: { type: 'object', required: ['userId'], properties: { userId: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } } }, async (request, reply) => {
+  fastify.get('/kyc/:userId', { preHandler: [verifyJWT, requireRole('admin')], schema: userIdParams }, async (request, reply) => {
     const { getKycByUser } = await import('../controllers/adminController.js');
     return getKycByUser(request, reply);
   });
+  // Admin: delete a specific KYC image field by user
+  fastify.delete('/kyc/:userId/file', { preHandler: [verifyJWT, requireRole('admin')], schema: kycDeleteSchema }, adminDeleteKycFile);
   // Ban / unban users (admin only)
   fastify.put('/users/:id/ban', { preHandler: [verifyJWT, requireRole('admin')], schema: idParams }, banUser);
   fastify.put('/users/:id/unban', { preHandler: [verifyJWT, requireRole('admin')], schema: idParams }, unbanUser);
@@ -42,6 +90,8 @@ export default async function adminRoutes(fastify, opts) {
   fastify.get('/jobs', { preHandler: [verifyJWT, requireRole('admin')] }, adminListJobs);
   // Admin: list all bookings with filters
   fastify.get('/bookings', { preHandler: [verifyJWT, requireRole('admin')] }, adminListBookings);
+  // Admin: list all special service requests with related user details
+  fastify.get('/special-requests', { preHandler: [verifyJWT, requireRole('admin')], schema: specialRequestListSchema }, adminListSpecialRequests);
   // Admin: list all quotes with filters
   fastify.get('/quotes', { preHandler: [verifyJWT, requireRole('admin')] }, adminListQuotes);
   // Admin: list all chats with filters

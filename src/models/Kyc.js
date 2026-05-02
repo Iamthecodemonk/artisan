@@ -10,13 +10,28 @@ const kycSchema = new mongoose.Schema({
 
   profileImage: { url: String, public_id: String },
   IdType: { type: String },
+  idNumber: { type: String },
   IdUploadFront: { url: String, public_id: String },
   IdUploadBack: { url: String, public_id: String },
+
+  provider: { type: String, enum: ['manual', 'dojah'], default: 'manual' },
+  verificationType: { type: String },
+  providerStatus: { type: String },
+  providerResponse: { type: Object },
+  failureReason: { type: String },
+  verifiedAt: { type: Date },
+  firstName: { type: String },
+  lastName: { type: String },
+  selfieVerification: {
+    match: { type: Boolean },
+    confidenceValue: { type: Number },
+    threshold: { type: Number },
+  },
 
   serviceCategory: { type: String },
   yearsExperience: { type: Number, default: 0 },
 
-  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+  status: { type: String, enum: ['pending', 'approved', 'rejected', 'pending_review'], default: 'pending' },
   reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   createdAt: { type: Date, default: Date.now },
 });

@@ -13,7 +13,9 @@ import artisanRoutes from './routes/artisanRoutes.js';
 import bookingRoutes from './routes/bookingRoutes.js';
 import chatRoutes from './routes/chatRoutes.js';
 import socketPlugin from './plugins/socket.js';
+import swaggerPlugin from './plugins/swagger.js';
 import kycRoutes from './routes/kycRoutes.js';
+import dojahKycRoutes from './routes/dojahKycRoutes.js';
 import locationsRoutes from './routes/locationsRoutes.js';
 import walletRoutes from './routes/walletRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
@@ -48,6 +50,11 @@ export default async function app(fastify, opts) {
   normalizeEnv('JWT_SECRET');
   normalizeEnv('SENDCHAMP_API_KEY');
   normalizeEnv('SENDCHAMP_DEFAULT_SENDER');
+  normalizeEnv('PAYSTACK_SECRET_KEY');
+  normalizeEnv('PAYSTACK_WEBHOOK_SECRET');
+  normalizeEnv('DOJAH_BASE_URL');
+  normalizeEnv('DOJAH_APP_ID');
+  normalizeEnv('DOJAH_SECRET_KEY');
   // Connect MongoDB (don't block app startup if DB is slow/unreachable)
   // connectDB will log and exit on fatal errors; here we start it but don't await
   connectDB()
@@ -79,6 +86,7 @@ export default async function app(fastify, opts) {
 
   // Register socket.io plugin (requires fastify-jwt to be available)
   await fastify.register(socketPlugin);
+  await fastify.register(swaggerPlugin);
 
   // Register routes
   // fastify.register(authRoutes, { prefix: 'api/auth' });
@@ -98,6 +106,7 @@ export default async function app(fastify, opts) {
   fastify.register(bookingRoutes, { prefix: '/api/bookings' });
   fastify.register(chatRoutes, { prefix: '/api/chat' });
   fastify.register(kycRoutes, { prefix: '/api/kyc' });
+  fastify.register(dojahKycRoutes, { prefix: '/api/kyc/dojah' });
   fastify.register(locationsRoutes, { prefix: '/api/locations' });
   fastify.register(walletRoutes, { prefix: '/api/wallet' });
   fastify.register(paymentRoutes, { prefix: '/api/payments' });

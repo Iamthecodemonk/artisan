@@ -22,6 +22,7 @@ const bookingSchema = new mongoose.Schema({
     default: "pending",
   },
   paymentStatus: { type: String, enum: ["unpaid", "paid"], default: "unpaid" },
+  paymentMode: { type: String, enum: ['upfront', 'afterCompletion'], default: 'upfront' },
   artisanApprovalStatus: {
     type: String,
     enum: ["pending", "accepted", "rejected"],
@@ -33,6 +34,8 @@ const bookingSchema = new mongoose.Schema({
   notes: String,
   awaitingReview: { type: Boolean, default: false },
   reviewed: { type: Boolean, default: false },
+  cancellationReason: { type: String },
+  cancelledBy: { type: String, enum: ['artisan','customer','system'], default: undefined },
   refundStatus: { type: String, enum: ['none','requested','refunded'], default: 'none' },
   acceptedQuote: { type: mongoose.Schema.Types.ObjectId, ref: 'Quote', default: null },
   createdAt: { type: Date, default: Date.now },

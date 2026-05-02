@@ -10,7 +10,7 @@ const transactionSchema = new mongoose.Schema({
   companyFee: { type: Number, default: 0 },
   status: {
     type: String,
-    enum: ["pending", "holding", "released", "paid", "refunded"],
+    enum: ["pending", "holding", "released", "paid", "refunded", "failed"],
     default: "pending",
   },
   paymentGatewayRef: String,
@@ -20,7 +20,8 @@ const transactionSchema = new mongoose.Schema({
   // transfer fields for payouts to artisan
   transferRef: { type: String },
   transferAmount: { type: Number },
-  transferStatus: { type: String, enum: ['none','pending','processing','success','failed'], default: 'none' },
+  transferStatus: { type: String, enum: ['none','pending','processing','processed','queued','completed','success','failed'], default: 'none' },
+  internalWalletCreditedAt: { type: Date },
   createdAt: { type: Date, default: Date.now },
   releasedAt: Date,
 });

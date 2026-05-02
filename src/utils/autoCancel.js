@@ -27,11 +27,12 @@ export function startAutoCancel(fastify) {
           booking.refundStatus = booking.refundStatus || 'none';
           await booking.save();
           try { 
+            const bookingName = booking?.service || 'your booking';
             await createNotification(fastify, booking.customerId, { 
               type: 'booking', 
               title: 'Booking auto-cancelled', 
-              body: `Booking ${booking._id} was auto-cancelled due to unpaid status.`, 
-              data: { bookingId: booking._id } 
+              body: `${bookingName} was auto-cancelled due to unpaid status.`, 
+              data: { bookingId: booking._id, bookingName } 
             }); 
           } catch (e) { 
             fastify.log?.warn?.('notify failed', e?.message); 
@@ -80,11 +81,12 @@ export function startAutoCancel(fastify) {
 
           // Notify customer
           try {
+            const bookingName = booking?.service || 'your booking';
             await createNotification(fastify, booking.customerId._id, {
               type: 'booking',
               title: 'Booking auto-cancelled',
-              body: `Booking ${booking._id} was cancelled because the artisan did not respond within 24 hours. ${booking.refundStatus === 'refunded' ? 'Refund has been processed.' : 'Refund will be processed shortly.'}`,
-              data: { bookingId: booking._id }
+              body: `${bookingName} was cancelled because the artisan did not respond within 24 hours. ${booking.refundStatus === 'refunded' ? 'Refund has been processed.' : 'Refund will be processed shortly.'}`,
+              data: { bookingId: booking._id, bookingName }
             });
           } catch (e) {
             fastify.log?.warn?.('notify customer failed', e?.message);
@@ -93,12 +95,17 @@ export function startAutoCancel(fastify) {
           // Notify artisan about missed booking
           try {
             if (booking.artisanId) {
-              await createNotification(fastify, booking.artisanId._id, {
-                type: 'booking',
-                title: 'Booking expired',
-                body: `Booking ${booking._id} was auto-cancelled because you did not respond within 24 hours.`,
-                data: { bookingId: booking._id }
-              });
+              try {
+                const bookingName = booking?.service || 'the booking';
+                await createNotification(fastify, booking.artisanId._id, {
+                  type: 'booking',
+                  title: 'Booking expired',
+                  body: `${bookingName} was auto-cancelled because you did not respond within 24 hours.`,
+                  data: { bookingId: booking._id, bookingName }
+                });
+              } catch (e) {
+                fastify.log?.warn?.('notify artisan failed', e?.message);
+              }
             }
           } catch (e) {
             fastify.log?.warn?.('notify artisan failed', e?.message);

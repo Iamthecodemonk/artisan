@@ -4,6 +4,10 @@ import Quote from '../models/Quote.js';
 import { createNotification } from '../utils/notifier.js';
 import axios from 'axios';
 import Job from '../models/Job.js';
+import { normalizePaymentMode } from '../utils/paymentMode.js';
+import { getPaystackCallbackUrl } from '../utils/paystack.js';
+const Artisan = (await import('../models/Artisan.js')).default;
+const Transaction = (await import('../models/Transaction.js')).default;
 
 // Customer posts requirements -> store as a chat message (create chat if missing)
 export async function postRequirement(request, reply) {
@@ -64,11 +68,12 @@ export async function createQuote(request, reply) {
       await booking.save();
     }
 
-    const summary = `Quote proposed (id: ${quote._id}) — total: ${quote.total}.`; 
+    const summary = `Quote proposed — total: ${quote.total}.`; 
     chat.messages.push({ senderId: request.user.id, message: summary });
     await chat.save();
 
-    await createNotification(request.server, booking.customerId._id, { type: 'quote', title: 'New quote', body: `Artisan proposed a quote for booking ${booking._id}`, data: { bookingId: booking._id, quoteId: quote._id } });
+    const bookingName = booking?.service || 'the booking';
+    await createNotification(request.server, booking.customerId._id, { type: 'quote', title: 'New quote', body: `Artisan proposed a quote for ${bookingName}`, data: { bookingId: booking._id, quoteId: quote._id } });
 
     return reply.code(201).send({ success: true, data: quote });
   } catch (err) {
@@ -101,7 +106,6 @@ export async function listQuotesDetailed(request, reply) {
 
     // fetch artisan profile for each unique artisan user id
     const artisanUserIds = [...new Set(quotes.map(q => String(q.artisanId?._id || q.artisanId)))];
-    const Artisan = (await import('../models/Artisan.js')).default;
     const artisanProfiles = await Artisan.find({ userId: { $in: artisanUserIds } }).lean();
     const artisanMap = {};
     for (const a of artisanProfiles) artisanMap[String(a.userId)] = a;
@@ -149,7 +153,8 @@ export async function createJobQuote(request, reply) {
 
     // notify job owner (client)
     try {
-      await createNotification(request.server, job.clientId?._id, { type: 'quote', title: 'New job quote', body: `An artisan proposed a quote for job ${job._id}`, data: { jobId: job._id, quoteId: quote._id } });
+      const jobName = job.title || 'the job';
+      await createNotification(request.server, job.clientId?._id, { type: 'quote', title: 'New job quote', body: `An artisan proposed a quote for ${jobName}`, data: { jobId: job._id, quoteId: quote._id, jobName } });
     } catch (e) {
       request.log?.warn?.('notify job owner failed', e?.message || e);
     }
@@ -173,7 +178,7 @@ export async function listJobQuotes(request, reply) {
 
     // fetch artisan profiles for the unique artisan user ids
     const artisanUserIds = [...new Set(quotes.map(q => String(q.artisanId?._id || q.artisanId)))].filter(Boolean);
-    const Artisan = (await import('../models/Artisan.js')).default;
+    // const Artisan = (await import('../models/Artisan.js')).default;
     const artisanProfiles = await Artisan.find({ userId: { $in: artisanUserIds } }).lean();
     const artisanMap = {};
     for (const a of artisanProfiles) artisanMap[String(a.userId)] = a;
@@ -212,17 +217,23 @@ export async function acceptQuote(request, reply) {
     const quote = await Quote.findById(quoteId);
     if (!quote || String(quote.bookingId) !== String(bookingId)) return reply.code(404).send({ success: false, message: 'Quote not found' });
 
+    const requestedPaymentMode = normalizePaymentMode(request.body?.paymentMode);
+    if (typeof request.body?.paymentMode !== 'undefined' && requestedPaymentMode === null) {
+      return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+    }
+
     // mark quote accepted and attach to booking
     quote.status = 'accepted';
     await quote.save();
 
     booking.acceptedQuote = quote._id;
-    // set booking as accepted and require immediate payment (frontend will use returned payment init)
-    booking.status = 'accepted';
+    if (requestedPaymentMode) booking.paymentMode = requestedPaymentMode;
+    booking.status = requestedPaymentMode === 'afterCompletion' ? 'awaiting-acceptance' : 'accepted';
     await booking.save();
 
     // notify artisan (include email notification when possible)
-    await createNotification(request.server, booking.artisanId._id, { type: 'quote', title: 'Quote accepted', body: `Customer accepted quote ${quote._id} for booking ${booking._id}`, data: { bookingId: booking._id, quoteId: quote._id, sendEmail: true, email: booking.artisanId?.email } });
+    const bookingName = booking?.service || 'the booking';
+    await createNotification(request.server, booking.artisanId._id, { type: 'quote', title: 'Quote accepted', body: `Customer accepted your quote for ${bookingName}`, data: { bookingId: booking._id, quoteId: quote._id, sendEmail: true, email: booking.artisanId?.email } });
 
     // ensure chat exists and push message
     let chat = booking.chatId ? await Chat.findById(booking.chatId) : null;
@@ -231,8 +242,12 @@ export async function acceptQuote(request, reply) {
       booking.chatId = chat._id;
       await booking.save();
     }
-    chat.messages.push({ senderId: request.user.id, message: `Customer accepted quote ${quote._id}. Proceed to payment.` });
+    chat.messages.push({ senderId: request.user.id, message: `Customer accepted the quote. Proceed to payment.` });
     await chat.save();
+
+    if (booking.paymentMode === 'afterCompletion') {
+      return reply.code(200).send({ success: true, data: { quote, booking, payment: null, message: 'Booking accepted for deferred payment. Pay after completion with /booking/:id/pay-after-completion.' } });
+    }
 
     // Initialize payment for the accepted quote's serviceCharge (frontend should complete the payment)
     if (!process.env.PAYSTACK_SECRET_KEY) {
@@ -245,11 +260,11 @@ export async function acceptQuote(request, reply) {
 
     const amountInKobo = Math.round(Number(quote.serviceCharge || 0) * 100);
     try {
-      const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { bookingId: booking._id, quoteId: quote._id } }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
+      const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { bookingId: booking._id, quoteId: quote._id }, callback_url: getPaystackCallbackUrl() }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
       const init = res?.data?.data;
       if (init) {
         // persist a pending transaction for reconciliation
-        const Transaction = (await import('../models/Transaction.js')).default;
+        // const Transaction = (await import('../models/Transaction.js')).default;
         await Transaction.create({ bookingId: booking._id, payerId: booking.customerId?._id || null, payeeId: booking.artisanId?._id || null, amount: quote.serviceCharge || 0, status: 'pending', paymentGatewayRef: init.reference });
       }
       return reply.code(201).send({ success: true, data: { quote, booking, payment: res.data.data } });
@@ -274,6 +289,10 @@ export async function payWithQuote(request, reply) {
     const quote = await Quote.findById(booking.acceptedQuote);
     if (!quote) return reply.code(404).send({ success: false, message: 'Quote not found' });
 
+    if (booking.paymentMode === 'afterCompletion') {
+      return reply.code(400).send({ success: false, message: 'Booking deferred to after completion; payment should be made after booking is completed.' });
+    }
+
     // use existing booking email or customer's email
     const email = booking.customerId?.email || request.body?.email;
     if (!email) return reply.code(400).send({ success: false, message: 'Email required to initialize payment' });
@@ -282,12 +301,12 @@ export async function payWithQuote(request, reply) {
 
     // Only initialize payment for the serviceCharge — other costs are paid outside the platform
     const amountInKobo = Math.round(Number(quote.serviceCharge || 0) * 100);
-    const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { bookingId, quoteId: quote._id } }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
+    const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { bookingId, quoteId: quote._id }, callback_url: getPaystackCallbackUrl() }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
 
     const init = res?.data?.data;
     if (init) {
       // persist a pending transaction for reconciliation
-      const Transaction = (await import('../models/Transaction.js')).default;
+      // const Transaction = (await import('../models/Transaction.js')).default;
       await Transaction.create({ bookingId: booking._id, payerId: request.user?.id || null, amount: quote.serviceCharge || 0, status: 'pending', paymentGatewayRef: init.reference });
     }
 
@@ -313,9 +332,62 @@ export async function acceptJobQuote(request, reply) {
     // only job owner can accept
     if (String(request.user?.id) !== String(job.clientId?._id)) return reply.code(403).send({ success: false, message: 'Forbidden' });
 
+    const requestedPaymentMode = normalizePaymentMode(request.body?.paymentMode) || 'upfront';
+    if (typeof request.body?.paymentMode !== 'undefined' && requestedPaymentMode === null) {
+      return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+    }
+
+    // Guard: avoid duplicate booking creation if this quote already has one
+    const existingBooking = await Booking.findOne({ acceptedQuote: quote._id });
+    if (existingBooking) {
+      if (!quote.bookingId) {
+        quote.bookingId = existingBooking._id;
+        await quote.save();
+      }
+      return reply.code(200).send({ success: true, data: { quote, booking: existingBooking, message: 'Booking already exists for this quote' } });
+    }
+
     // mark quote accepted
     quote.status = 'accepted';
     await quote.save();
+
+    if (requestedPaymentMode === 'afterCompletion') {
+      const bookingPayload = {
+        customerId: job.clientId?._id || job.clientId,
+        artisanId: quote.artisanId,
+        service: job.title || (Array.isArray(quote.items) && quote.items[0]?.name) || 'Job quote service',
+        schedule: job.schedule || new Date(),
+        price: quote.total || 0,
+        status: 'awaiting-acceptance',
+        paymentStatus: 'unpaid',
+        paymentMode: 'afterCompletion',
+        acceptedQuote: quote._id,
+      };
+
+      const booking = await Booking.create(bookingPayload);
+      quote.bookingId = booking._id;
+      await quote.save();
+
+      job.status = 'closed';
+      await job.save();
+
+      let chat = null;
+      try {
+        chat = await Chat.create({ bookingId: booking._id, participants: [booking.customerId, booking.artisanId], messages: [] });
+        booking.chatId = chat._id;
+        await booking.save();
+      } catch (e) {
+        request.log?.warn?.('failed to create chat for deferred job quote booking', e?.message || e);
+      }
+
+      try {
+        await createNotification(request.server, quote.artisanId, { type: 'quote', title: 'Quote accepted', body: `Customer accepted your quote for job "${job.title}". Booking created with deferred payment.`, data: { quoteId: quote._id, jobId: job._id, bookingId: booking._id, sendEmail: true, email: job.clientId?.email } });
+      } catch (e) {
+        request.log?.warn?.('notify hired artisan failed', e?.message || e);
+      }
+
+      return reply.code(200).send({ success: true, data: { quote, booking, payment: null, message: 'Booking created with deferred payment; pay after completion using /booking/:id/pay-after-completion.' } });
+    }
 
     // Do not close the job here; it will be closed after successful payment and booking creation.
 
@@ -324,7 +396,7 @@ export async function acceptJobQuote(request, reply) {
     // notify artisan that their quote was accepted and payment is required
     try {
       const clientEmail = job.clientId?.email || null;
-      await createNotification(request.server, quote.artisanId, { type: 'quote', title: 'Quote accepted — awaiting payment', body: `Customer accepted quote ${quote._id} for job "${job.title}". Please await payment confirmation.`, data: { quoteId: quote._id, jobId: job._id, sendEmail: true, email: clientEmail } });
+      await createNotification(request.server, quote.artisanId, { type: 'quote', title: 'Quote accepted — awaiting payment', body: `Customer accepted your quote for job "${job.title}". Please await payment confirmation.`, data: { quoteId: quote._id, jobId: job._id, sendEmail: true, email: clientEmail } });
     } catch (e) {
       request.log?.warn?.('notify hired artisan failed', e?.message || e);
     }
@@ -339,10 +411,9 @@ export async function acceptJobQuote(request, reply) {
 
     const amountInKobo = Math.round(Number(quote.total || 0) * 100);
     try {
-      const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { jobId: job._id, quoteId: quote._id } }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
+      const res = await axios.post('https://api.paystack.co/transaction/initialize', { email, amount: amountInKobo, metadata: { jobId: job._id, quoteId: quote._id }, callback_url: getPaystackCallbackUrl() }, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
       const init = res?.data?.data;
       if (init) {
-        const Transaction = (await import('../models/Transaction.js')).default;
         // create a transaction record referencing the quote (booking will be attached upon payment confirmation)
         await Transaction.create({ quoteId: quote._id, payerId: job.clientId?._id || null, payeeId: quote.artisanId || null, amount: quote.total || 0, status: 'pending', paymentGatewayRef: init.reference });
       }

@@ -2,9 +2,12 @@ import SpecialServiceRequest from '../models/SpecialServiceRequest.js';
 import User from '../models/User.js';
 import Artisan from '../models/Artisan.js';
 import Booking from '../models/Booking.js';
+import Chat from '../models/Chat.js';
 import Transaction from '../models/Transaction.js';
 import axios from 'axios';
 import { createNotification } from '../utils/notifier.js';
+import { normalizePaymentMode } from '../utils/paymentMode.js';
+import { getPaystackCallbackUrl } from '../utils/paystack.js';
 
 // Create a new special service request (client)
 export const createSpecialServiceRequest = async (req, reply) => {
@@ -69,15 +72,23 @@ export const createSpecialServiceRequest = async (req, reply) => {
 
     const doc = await SpecialServiceRequest.create(payload);
 
-    // Notify artisan
+    // Notify artisan and client
     try {
-      await createNotification(req.server, artisanId, {
-        title: 'New special service request',
-        body: `${client?.name || 'A client'} sent you a request`,
-        payload: { type: 'special_request', requestId: String(doc._id) }
-      });
+      const requestName = doc.title || doc.categoryName || 'special request';
+      await Promise.all([
+        createNotification(req.server, artisanId, {
+          title: 'New special service request',
+          body: `${client?.name || 'A client'} sent you a request`,
+          data: { type: 'special_request', requestId: String(doc._id), requestName }
+        }),
+        createNotification(req.server, userId, {
+          title: 'Request submitted',
+          body: `Your special service request has been sent to the artisan. You'll be notified when they respond.`,
+          data: { type: 'special_request', requestId: String(doc._id), requestName }
+        })
+      ]);
     } catch (e) {
-      req.log?.warn?.('failed to send special request notification', e?.message || e);
+      req.log?.warn?.('failed to send special request notifications', e?.message || e);
     }
 
     return reply.code(201).send({ success: true, data: doc });
@@ -199,10 +210,11 @@ export const updateSpecialServiceRequest = async (req, reply) => {
 
       // notify client
       try {
+        const requestName = doc.title || doc.categoryName || 'special request';
         await createNotification(req.server, doc.clientId, {
           title: 'Your request has a response',
           body: `Artisan responded to your special service request`,
-          payload: { type: 'special_request', requestId: String(doc._id) }
+          data: { type: 'special_request', requestId: String(doc._id), requestName }
         });
       } catch (e) { req.log?.warn?.('notify client failed', e?.message || e); }
 
@@ -226,61 +238,121 @@ export const updateSpecialServiceRequest = async (req, reply) => {
         }
       }
 
-        // Determine price: prefer explicit selectedPrice from client, then artisan fixed quote,
-        // then first option from artisan range, then client's budget.
-        const selectedPrice = typeof updates.selectedPrice !== 'undefined' ? Number(updates.selectedPrice) : null;
-        let price = null;
-        if (selectedPrice && !Number.isNaN(selectedPrice) && Number(selectedPrice) > 0) price = selectedPrice;
-        else if (doc.artisanReply?.quote) price = Number(doc.artisanReply.quote);
-        else if (Array.isArray(doc.artisanReply?.options) && doc.artisanReply.options.length) price = Number(doc.artisanReply.options[0]);
-        else price = (typeof doc.budget !== 'undefined' ? Number(doc.budget) : null);
-        if (!price || Number.isNaN(price) || Number(price) <= 0) return reply.code(400).send({ success: false, message: 'No valid price available to create booking' });
+      const requestedPaymentMode = typeof updates.paymentMode !== 'undefined' ? normalizePaymentMode(updates.paymentMode) : 'upfront';
+      if (typeof updates.paymentMode !== 'undefined' && !requestedPaymentMode) {
+        return reply.code(400).send({ success: false, message: 'Invalid paymentMode' });
+      }
 
-        // Defer Booking creation until payment is confirmed by gateway.
-        // Mark request as accepted and initialize payment (metadata will include specialRequestId).
-        doc.status = 'accepted';
+      // Determine price: prefer explicit selectedPrice from client, then artisan fixed quote,
+      // then first option from artisan range, then client's budget.
+      const selectedPrice = typeof updates.selectedPrice !== 'undefined' ? Number(updates.selectedPrice) : null;
+      let price = null;
+      if (selectedPrice && !Number.isNaN(selectedPrice) && Number(selectedPrice) > 0) price = selectedPrice;
+      else if (doc.artisanReply?.quote) price = Number(doc.artisanReply.quote);
+      else if (Array.isArray(doc.artisanReply?.options) && doc.artisanReply.options.length) price = Number(doc.artisanReply.options[0]);
+      else price = (typeof doc.budget !== 'undefined' ? Number(doc.budget) : null);
+      if (!price || Number.isNaN(price) || Number(price) <= 0) return reply.code(400).send({ success: false, message: 'No valid price available to create booking' });
+
+      if (requestedPaymentMode === 'afterCompletion') {
+        const bookingPayload = {
+          customerId: doc.clientId,
+          artisanId: doc.artisanId,
+          service: doc.title || doc.categoryName || 'Special service request',
+          price: Number(price),
+          schedule: doc.date || new Date(),
+          paymentStatus: 'unpaid',
+          paymentMode: 'afterCompletion',
+          status: 'awaiting-acceptance',
+          notes: doc.description || undefined,
+        };
+
+        const booking = await Booking.create(bookingPayload);
+        const chat = await Chat.create({ bookingId: booking._id, participants: [doc.clientId, doc.artisanId] });
+        booking.chatId = chat._id;
+        await booking.save();
+
+        doc.status = 'confirmed';
+        doc.bookingId = booking._id;
         doc.updatedAt = new Date();
         await doc.save();
 
-        let paymentInit = null;
-        try {
-          if (process.env.PAYSTACK_SECRET_KEY) {
-            const email = req.user?.email || req.body?.email || null;
-            req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), action: 'accept-init-payment', emailProvided: !!email, selectedPrice: price }, 'special request accept: payment init attempt');
-            if (!email) {
-              // create a pending Transaction record so there is a local trace (email can be supplied later)
-              const tx = await Transaction.create({ specialRequestId: doc._id, payerId: req.user?.id || null, amount: Number(price) || 0, status: 'pending', paymentGatewayRef: null });
-              req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), txId: tx._id, amount: Number(price) || 0 }, 'created pending Transaction because email not available');
-            } else {
-              const amountInKobo = Math.round(Number(price) * 100);
-              const initPayload = { email, amount: amountInKobo, metadata: { specialRequestId: String(doc._id), selectedPrice: Number(price) } };
-              req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), initPayload }, 'calling paystack initialize for special request');
-              const res = await axios.post('https://api.paystack.co/transaction/initialize', initPayload, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
-              paymentInit = res?.data?.data || null;
-              req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), paymentInit }, 'paystack initialize response for special request');
-              if (paymentInit) {
-                const tx = await Transaction.create({ specialRequestId: doc._id, payerId: req.user?.id || null, amount: Number(price) || 0, status: 'pending', paymentGatewayRef: paymentInit.reference });
-                req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), txId: tx._id, paymentReference: paymentInit.reference }, 'created Transaction from paystack init');
-              }
+        // Notify artisan and client that booking has been created and awaits acceptance
+        const bookingName = booking?.service || booking?.notes || 'Booking';
+        const requestName = doc.title || doc.categoryName || bookingName || 'special request';
+        const notifyArtisan = createNotification(req.server, doc.artisanId, {
+          title: 'Special request confirmed',
+          body: 'Your client confirmed the request and the booking has been created. Please accept it to begin work.',
+          data: { type: 'special_request', requestId: String(doc._id), bookingId: String(booking._id), bookingName, requestName }
+        }).catch(e => req.log?.warn?.('notify artisan failed', e?.message || e));
+        const notifyClient = createNotification(req.server, doc.clientId, {
+          title: 'Booking created',
+          body: 'Your special service request has been confirmed and the booking is awaiting artisan acceptance.',
+          data: { type: 'special_request', requestId: String(doc._id), bookingId: String(booking._id), bookingName, requestName }
+        }).catch(e => req.log?.warn?.('notify client failed', e?.message || e));
+        await Promise.allSettled([notifyArtisan, notifyClient]);
+
+        return reply.code(200).send({ success: true, data: { request: doc, booking, payment: null } });
+      }
+
+      // Defer Booking creation until payment is confirmed by gateway.
+      // Mark request as accepted and initialize payment (metadata will include specialRequestId).
+      doc.status = 'accepted';
+      doc.updatedAt = new Date();
+      await doc.save();
+
+      let paymentInit = null;
+      try {
+        if (process.env.PAYSTACK_SECRET_KEY) {
+          const email = req.user?.email || req.body?.email || null;
+          req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), action: 'accept-init-payment', emailProvided: !!email, selectedPrice: price }, 'special request accept: payment init attempt');
+          if (!email) {
+            // create a pending Transaction record so there is a local trace (email can be supplied later)
+            const tx = await Transaction.create({ specialRequestId: doc._id, payerId: req.user?.id || null, amount: Number(price) || 0, status: 'pending', paymentGatewayRef: null });
+            req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), txId: tx._id, amount: Number(price) || 0 }, 'created pending Transaction because email not available');
+          } else {
+            const amountInKobo = Math.round(Number(price) * 100);
+            const initPayload = { email, amount: amountInKobo, metadata: { specialRequestId: String(doc._id), selectedPrice: Number(price) }, callback_url: getPaystackCallbackUrl() };
+            req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), initPayload }, 'calling paystack initialize for special request');
+            const res = await axios.post('https://api.paystack.co/transaction/initialize', initPayload, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
+            paymentInit = res?.data?.data || null;
+            req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), paymentInit }, 'paystack initialize response for special request');
+            if (paymentInit) {
+              const tx = await Transaction.create({ specialRequestId: doc._id, payerId: req.user?.id || null, amount: Number(price) || 0, status: 'pending', paymentGatewayRef: paymentInit.reference });
+              req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), txId: tx._id, paymentReference: paymentInit.reference }, 'created Transaction from paystack init');
             }
           }
-        } catch (e) {
-          req.log?.warn?.('payment initialization failed for special request (deferred booking flow)', e?.response?.data || e?.message || e);
         }
+      } catch (e) {
+        req.log?.warn?.('payment initialization failed for special request (deferred booking flow)', e?.response?.data || e?.message || e);
+      }
 
-        // notify parties that payment is required to create booking
-        const notifyArtisanTask = createNotification(req.server, doc.artisanId, { title: 'Request accepted — payment pending', body: `Client accepted your quote. Awaiting payment to create booking.`, payload: { type: 'special_request', requestId: String(doc._id) } }).catch(e => req.log?.warn?.('notify artisan failed', e?.message || e));
-        const notifyClientTask = createNotification(req.server, doc.clientId, { title: 'Payment required', body: `Please complete payment to confirm booking for request ${doc._id}.`, payload: { type: 'special_request', requestId: String(doc._id) } }).catch(e => req.log?.warn?.('notify client failed', e?.message || e));
-        await Promise.allSettled([notifyArtisanTask, notifyClientTask]);
+      // notify parties that payment is required to create booking
+      const requestName = doc.title || doc.categoryName || 'special request';
+      const notifyArtisanTask = createNotification(req.server, doc.artisanId, { title: 'Request accepted — payment pending', body: `Client accepted your quote. Awaiting payment to create booking.`, data: { type: 'special_request', requestId: String(doc._id), requestName } }).catch(e => req.log?.warn?.('notify artisan failed', e?.message || e));
+      const notifyClientTask = createNotification(req.server, doc.clientId, { title: 'Payment required', body: `Please complete payment to confirm your special request.`, data: { type: 'special_request', requestId: String(doc._id), requestName } }).catch(e => req.log?.warn?.('notify client failed', e?.message || e));
+      await Promise.allSettled([notifyArtisanTask, notifyClientTask]);
 
-        return reply.code(200).send({ success: true, data: { request: doc, booking: null, payment: paymentInit } });
+      return reply.code(200).send({ success: true, data: { request: doc, booking: null, payment: paymentInit } });
     }
 
     // Generic updates allowed for owner (client) or artisan on their fields
     const allowed = ['title','description','location','date','time','urgency','budget','attachments','status'];
     let changed = false;
+    // prepare to detect attachment diffs
+    let attachmentsAdded = [];
+    let attachmentsRemoved = [];
+    const prevAttachments = Array.isArray(doc.attachments) ? doc.attachments : [];
+    const prevUrls = prevAttachments.map(a => (typeof a === 'string' ? a : (a && (a.url || a.filename || a.path) ) )).filter(Boolean);
+
     for (const k of allowed) {
       if (typeof updates[k] !== 'undefined') {
+        // compute attachment diffs before applying
+        if (k === 'attachments') {
+          const newAttachments = Array.isArray(updates.attachments) ? updates.attachments : [];
+          const newUrls = newAttachments.map(a => (typeof a === 'string' ? a : (a && (a.url || a.filename || a.path)))).filter(Boolean);
+          attachmentsAdded = newUrls.filter(u => !prevUrls.includes(u));
+          attachmentsRemoved = prevUrls.filter(u => !newUrls.includes(u));
+        }
         doc[k] = updates[k];
         changed = true;
       }
@@ -288,6 +360,29 @@ export const updateSpecialServiceRequest = async (req, reply) => {
     if (changed) {
       doc.updatedAt = new Date();
       await doc.save();
+      // Notify the other party about the update (non-blocking)
+      try {
+        const actorId = String(userId);
+        const otherId = String(doc.clientId) === actorId ? String(doc.artisanId) : String(doc.clientId);
+        const actorUser = await User.findById(actorId).select('name').lean().catch(() => null);
+
+        // If attachments changed, send a focused notification describing added/removed items
+        if ((attachmentsAdded && attachmentsAdded.length) || (attachmentsRemoved && attachmentsRemoved.length)) {
+          const title = `Attachments updated`;
+          let bodyParts = [];
+          if (attachmentsAdded && attachmentsAdded.length) bodyParts.push(`${attachmentsAdded.length} added`);
+          if (attachmentsRemoved && attachmentsRemoved.length) bodyParts.push(`${attachmentsRemoved.length} removed`);
+          const body = `${actorUser?.name || 'The user'} updated attachments (${bodyParts.join(', ')}).`;
+          createNotification(req.server, otherId, { title, body, data: { type: 'special_request', requestId: String(doc._id), requestName: doc.title || doc.categoryName || 'special request', attachmentsAdded, attachmentsRemoved } }).catch(e => req.log?.warn?.('notify attachments change failed', e?.message || e));
+        } else {
+          const title = `Request updated`;
+          const body = `${actorUser?.name || 'The user'} updated the special request.`;
+          // fire-and-forget
+          createNotification(req.server, otherId, { title, body, data: { type: 'special_request', requestId: String(doc._id), requestName: doc.title || doc.categoryName || 'special request' } }).catch(e => req.log?.warn?.('notify other party failed', e?.message || e));
+        }
+      } catch (e) {
+        req.log?.warn?.('special-request update notify failed', e?.message || e);
+      }
     }
     return reply.send({ success: true, data: doc });
   } catch (err) {
@@ -372,10 +467,11 @@ export const respondToSpecialServiceRequest = async (req, reply) => {
 
     // notify client
     try {
-      await createNotification(req.server, doc.clientId, {
+        const requestName = doc.title || doc.categoryName || 'special request';
+        await createNotification(req.server, doc.clientId, {
         title: 'Your request has a response',
         body: `Artisan responded to your special service request`,
-        payload: { type: 'special_request', requestId: String(doc._id) }
+        data: { type: 'special_request', requestId: String(doc._id), requestName }
       });
     } catch (e) { req.log?.warn?.('notify client failed', e?.message || e); }
 
@@ -427,7 +523,7 @@ export const payForSpecialService = async (req, reply) => {
       // initialize Paystack transaction for special request (metadata includes specialRequestId and selectedPrice)
       try {
         const amountInKobo = Math.round(Number(price) * 100);
-        const initPayload = { email, amount: amountInKobo, metadata: { specialRequestId: String(doc._id), selectedPrice: Number(price) } };
+        const initPayload = { email, amount: amountInKobo, metadata: { specialRequestId: String(doc._id), selectedPrice: Number(price) }, callback_url: getPaystackCallbackUrl() };
         req.log?.info?.({ reqId: req.id, specialRequestId: String(doc._id), initPayload }, 'calling paystack initialize for special request (deferred)');
         const res = await axios.post('https://api.paystack.co/transaction/initialize', initPayload, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } });
         const init = res?.data?.data || null;

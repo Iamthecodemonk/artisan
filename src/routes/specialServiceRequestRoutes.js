@@ -1,6 +1,7 @@
 import { createSpecialServiceRequest, listSpecialServiceRequests, getSpecialServiceRequest, updateSpecialServiceRequest, respondToSpecialServiceRequest, payForSpecialService } from '../controllers/specialServiceRequestController.js';
 import { verifyJWT } from '../middlewares/auth.js';
 import { requireRole } from '../middlewares/roles.js';
+import { requireActiveArtisan } from '../middlewares/requireActiveArtisan.js';
 
 const idParamSchema = { params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-fA-F]{24}$' } } } };
 
@@ -41,6 +42,7 @@ const updateSchema = {
     type: 'object',
     properties: {
       status: { type: 'string', enum: ['pending','responded','accepted','in_progress','completed','cancelled','rejected','declined'] },
+      paymentMode: { type: 'string', enum: ['upfront','afterCompletion'] },
       note: {
         anyOf: [
           { type: 'string' },
@@ -81,6 +83,11 @@ const responseBodySchema = {
 };
 
 export default async function specialServiceRequestRoutes(fastify, opts) {
+  const requireActiveWhenArtisan = async (request, reply) => {
+    if (request.user?.role !== 'artisan') return;
+    return requireActiveArtisan()(request, reply);
+  };
+
   // Create: supports JSON or multipart/form-data (attachments)
   // For multipart/form-data requests we must NOT attach a body JSON schema —
   // Fastify will validate before the multipart parser runs and return "body must be object".
@@ -96,13 +103,13 @@ export default async function specialServiceRequestRoutes(fastify, opts) {
   fastify.get('/:id/response', { preHandler: verifyJWT, schema: idParamSchema }, getSpecialServiceRequest);
 
   // Update (respond / accept / generic updates)
-  fastify.put('/:id', { preHandler: verifyJWT, schema: { ...idParamSchema, ...updateSchema } }, updateSpecialServiceRequest);
+  fastify.put('/:id', { preHandler: [verifyJWT, requireActiveWhenArtisan], schema: { ...idParamSchema, ...updateSchema } }, updateSpecialServiceRequest);
 
   // Artisan-specific response route: keeps client code that calls `/response` working
-  fastify.put('/:id/response', { preHandler: [verifyJWT, requireRole(['artisan'])], schema: { ...idParamSchema, ...responseBodySchema } }, updateSpecialServiceRequest);
+  fastify.put('/:id/response', { preHandler: [verifyJWT, requireActiveArtisan()], schema: { ...idParamSchema, ...responseBodySchema } }, updateSpecialServiceRequest);
 
   // POST response: create or update artisan response (idempotent)
-  fastify.post('/:id/response', { preHandler: [verifyJWT, requireRole(['artisan'])], schema: { ...idParamSchema, ...responseBodySchema } }, (request, reply) => import('../controllers/specialServiceRequestController.js').then(m => m.respondToSpecialServiceRequest(request, reply)));
+  fastify.post('/:id/response', { preHandler: [verifyJWT, requireActiveArtisan()], schema: { ...idParamSchema, ...responseBodySchema } }, (request, reply) => import('../controllers/specialServiceRequestController.js').then(m => m.respondToSpecialServiceRequest(request, reply)));
 
   // Initialize payment for a special service booking (if booking created but payment not initialized)
   fastify.post('/:id/pay', { preHandler: verifyJWT, schema: { ...idParamSchema, body: { type: 'object', properties: { email: { type: 'string', format: 'email' } } } } }, (request, reply) => import('../controllers/specialServiceRequestController.js').then(m => m.payForSpecialService(request, reply)));
